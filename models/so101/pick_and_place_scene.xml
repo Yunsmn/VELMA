@@ -1,0 +1,73 @@
+<mujoco model="pick_and_place_scene">
+    <include file="so101_new_calib.xml" />
+
+    <option timestep="0.002" gravity="0 0 -9.81" noslip_iterations="3" impratio="10" cone="elliptic"/>
+
+    <default>
+        <geom solref="0.001 1" solimp="0.99 0.99 0.001"/>
+    </default>
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="90" elevation="-20" />
+        <!-- znear=0.005 very small to avoid clipping through finger meshes -->
+        <map znear="0.005" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
+        <material name="cube_material" rgba="0.9 0.1 0.1 1" />  <!-- red cube -->
+        <material name="container_material" rgba="0.2 0.2 0.8 0.8" />  <!-- blue container -->
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+        <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
+
+        <!-- Object to pick up: upright cylinder ("cup"), 3cm diameter x 5cm tall.
+             Body name/geom name kept as "cube"/"cube_geom" so state + grasp detection work unchanged. -->
+        <body name="cube" pos="0.24 -0.13 0.015">
+            <freejoint name="cube_joint"/>
+            <geom name="cube_geom" type="box" size="0.015 0.015 0.015" mass="0.03" material="cube_material" friction="0.5 0.05 0.001"/>
+            <!-- Cube position sensor -->
+            <site name="cube_center" pos="0 0 0" size="0.005"/>
+        </body>
+
+        <!-- Container (basket) to place cube into, at azimuth -70 deg / r 0.29 m.
+             The old (-0.25, 0.15) was azimuth 149 deg — about 46 deg past the
+             shoulder_pan stop (+-110 deg), so the arm could never reach it and
+             place() into it was impossible. This pose is inside the pan range and
+             sits in the side camera's foreground, where the arm at home does not
+             occlude it (the +y side does). 0.19 m clear of the cube. -->
+        <body name="container" pos="0.10 -0.27 0.0" quat="1 0 0 0">
+            <freejoint name="container_joint"/>
+            <!-- Container walls (open top) -->
+            <!-- Bottom -->
+            <geom name="container_bottom" type="box" size="0.08 0.08 0.01" pos="0 0 0.01" material="container_material" friction="0.3"/>
+            <!-- Front wall -->
+            <geom name="container_front" type="box" size="0.08 0.01 0.06" pos="0 -0.08 0.06" material="container_material" friction="0.3"/>
+            <!-- Back wall -->
+            <geom name="container_back" type="box" size="0.08 0.01 0.06" pos="0 0.08 0.06" material="container_material" friction="0.3"/>
+            <!-- Left wall -->
+            <geom name="container_left" type="box" size="0.01 0.08 0.06" pos="-0.08 0 0.06" material="container_material" friction="0.3"/>
+            <!-- Right wall -->
+            <geom name="container_right" type="box" size="0.01 0.08 0.06" pos="0.08 0 0.06" material="container_material" friction="0.3"/>
+            <!-- Container center site (for target positioning) -->
+            <site name="container_center" pos="0 0 0.05" size="0.01"/>
+        </body>
+    </worldbody>
+
+    <sensor>
+        <!-- Cube position -->
+        <framepos name="cube_pos" objtype="body" objname="cube" />
+        <!-- Container position -->
+        <framepos name="container_pos" objtype="body" objname="container" />
+        <!-- Gripper TCP position -->
+        <framepos name="gripper_pos" objtype="site" objname="gripperframe" />
+        <!-- Grasp point position (between fingers) -->
+        <framepos name="grasp_pos" objtype="site" objname="graspframe" />
+    </sensor>
+</mujoco>

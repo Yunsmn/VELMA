@@ -1,0 +1,23 @@
+# Perception GPU sidecar venv -- CUDA torch + Falcon-Perception (open-vocab
+# grounding + instance segmentation), run as `python -m perception.gpu_sidecar`.
+# The robot venv talks to it over stdio JSON (see perception/client.py). Separate
+# venv because it needs CUDA torch and its own Python -- use Python 3.11.
+#
+#   python3.11 -m venv percept_gpu_venv
+#   ./percept_gpu_venv/bin/pip install -r perception/requirements-gpu.txt
+#
+# CUDA torch wheels live on the PyTorch CUDA index, not PyPI:
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.12.1+cu130
+
+transformers==5.14.1
+accelerate==1.14.0
+pycocotools==2.0.11
+einops==0.8.2
+
+numpy==2.4.6
+pillow==12.3.0
+
+# transformers pulls its own transitive deps (huggingface_hub, safetensors,
+# tokenizers, tqdm, ...) -- not pinned here, let pip resolve them against the pins.

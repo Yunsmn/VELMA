@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "so101-sim": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp"
+    }
+  }
+}

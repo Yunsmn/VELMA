@@ -1,0 +1,12 @@
+backend:
+  type: simulation
+  simulation:
+    model: models/so101/pick_and_place_scene.xml
+    viewer: false
+llm:
+  provider: cli
+  model: ''
+  base_url: http://localhost:11434
+server:
+  transport: http
+  port: 3001

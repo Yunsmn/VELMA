@@ -1,0 +1,27 @@
+# Robot venv — renders MuJoCo, runs the MCP server, no torch.
+#   python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+#
+# Pinned to the versions this project is validated against (Python 3.11+; the
+# reference venv here runs 3.14). If you need a different major version of any
+# of these, drop the pin and let pip resolve, then re-test.
+
+mujoco==3.9.0
+mcp==1.27.2
+
+numpy==2.4.6
+pillow==12.2.0
+pyyaml==6.0.3
+python-dotenv==1.2.2
+requests==2.34.2
+
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+
+questionary==2.1.1
+rich==15.0.0
+
+# --- Optional: real SO-101 hardware backend (robot/backends/hardware.py) ---
+# Only needed if config.yaml's backend.type is "hardware", not for the MuJoCo
+# simulation. Not installed by default — the hardware backend raises a clear
+# error naming this package if it's missing.
+#   pip install lerobot

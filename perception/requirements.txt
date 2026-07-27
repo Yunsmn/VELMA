@@ -1,0 +1,23 @@
+# Perception sidecar venv — CPU-only torch + FastSAM (ultralytics) + Depth-Anything
+# (transformers). Runs `python -m perception.sidecar` as a long-lived subprocess that
+# the robot venv talks to over stdio JSON (see perception/client.py). Needs its own
+# venv because torch cannot coexist with the robot venv's Python (3.14 at time of
+# writing; torch's CPU wheels lag newer CPython releases) — use Python 3.11/3.12.
+#
+#   python3.11 -m venv percept_venv
+#   ./percept_venv/bin/pip install -r perception/requirements.txt
+#
+# CPU-only torch wheels live on a separate PyTorch index, not PyPI:
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.12.1+cpu
+torchvision==0.27.1+cpu
+
+numpy==2.4.4
+pillow==12.2.0
+transformers==5.12.1
+ultralytics==8.4.84
+
+# transformers/ultralytics pull their own transitive deps (huggingface_hub,
+# safetensors, tokenizers, opencv-python, tqdm, ...) — not pinned here, let pip
+# resolve them against the pins above.

@@ -1,0 +1,21 @@
+# Virtual environments -- recreate from requirements.txt and
+# perception/requirements.txt (CPU sidecar) / perception/requirements-gpu.txt (Falcon).
+venv/
+percept_venv/
+percept_gpu_venv/
+
+# Local backups, kept on disk but not shipped.
+backups/
+*.bak
+
+# Scratch, caches, logs.
+scratch/
+__pycache__/
+*.pyc
+MUJOCO_LOG.TXT
+
+# Secrets and local runtime state.
+.env
+
+# Documents -- not part of the runtime.
+*.pdf
