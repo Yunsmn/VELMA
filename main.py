@@ -55,9 +55,16 @@ def main() -> None:
     llm_cfg     = cfg.get("llm", {})
 
     backend_type = backend_cfg.get("type", "simulation")
-    model_path   = backend_cfg.get("simulation", {}).get(
-        "model", "models/so101/pick_and_place_scene.xml"
-    )
+    # The MuJoCo model differs by backend and must not be shared. In simulation it
+    # is the scene being manipulated; on hardware it is used for kinematics only,
+    # so it has to be the arm alone — a scene model would populate the kinematic
+    # world with a cube and container the real table does not contain.
+    if backend_type == "hardware":
+        model_path = backend_cfg.get("hardware", {}).get(
+            "model", "models/so101/so101_new_calib.xml")
+    else:
+        model_path = backend_cfg.get("simulation", {}).get(
+            "model", "models/so101/pick_and_place_scene.xml")
     # Allow a test harness to pick the scene without editing config.yaml.
     model_path   = os.environ.get("SO101_SCENE", model_path)
     open_viewer  = backend_type == "simulation" and backend_cfg.get("simulation", {}).get("viewer", False)

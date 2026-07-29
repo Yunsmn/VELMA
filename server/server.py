@@ -151,6 +151,20 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
     def move_to_position(x_m: float, y_m: float, z_m: float,
                          gain: float = 0.5,
                          lock_wrist: bool = True):
+        # On hardware, solve the whole target in the model and command it once.
+        # The controller's iterative version steps small joint increments against
+        # the robot, which is exact in simulation but on a real arm produces
+        # increments below the servo stiction floor: the arm does not move, the
+        # error never shrinks, and it exhausts its budget reporting "Max steps" —
+        # indistinguishable from an unreachable target, which is what actually
+        # went wrong. Solving first also lets an out-of-reach request be REFUSED
+        # with a reason instead of being attempted and silently failing.
+        solver = getattr(b, "move_to_xyz", None)
+        if solver is not None:
+            out = solver([x_m, y_m, z_m])
+            if not out.get("moved"):
+                return [json.dumps({"status": "unreachable", **out}, indent=2)]
+            return [json.dumps({"status": "success", **out}, indent=2)]
         return _wrap(controller.move_to_cartesian(x_m, y_m, z_m,
                                                   lock_wrist=lock_wrist,
                                                   gain=gain), b)
@@ -607,6 +621,32 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
             "end_effector_m": st.end_effector_m,
             "joint_angles_deg": st.joint_angles_deg,
         }, indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE. Move the gripper to an absolute Cartesian target (metres, base "
+        "frame: x forward, y left, z up; table at z=0). Solves IK inside the model "
+        "and commands the finished joint solution in one move, instead of "
+        "iterating small increments against the arm — those land below the servo "
+        "stiction floor and stall, which is why move_to_position reports 'Max "
+        "steps'. Returns target vs reached and the error in mm."
+    ))
+    def move_to_xyz(x_m: float, y_m: float, z_m: float):
+        mover = getattr(b, "move_to_xyz", None)
+        if mover is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success", **mover([x_m, y_m, z_m])}, indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE. Solve IK for a Cartesian target WITHOUT moving the arm. Reports "
+        "whether it is reachable, the residual, and the joint angles it would need."
+    ))
+    def check_reachable(x_m: float, y_m: float, z_m: float):
+        solver = getattr(b, "solve_ik", None)
+        if solver is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success", **solver([x_m, y_m, z_m])}, indent=2)]
 
     # ── Servo-space jogging (hardware only) ───────────────────────────────────
 

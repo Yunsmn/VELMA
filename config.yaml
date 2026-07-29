@@ -1,12 +1,17 @@
 backend:
-  type: hardware
+  type: simulation
   hardware:
     port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6056353-if00
     id: my_follower_arm
-  simulation:
-    # Arm only: on hardware this model is used for kinematics (IK/FK), so it must
-    # not carry scene objects the real table does not have.
+    # Kinematics only. Deliberately the ARM ALONE: on hardware this model is used
+    # for IK/FK, and a scene model would put a cube and container into the
+    # kinematic world that the real table does not have.
     model: models/so101/so101_new_calib.xml
+  simulation:
+    # The full scene, with objects to manipulate. Keep this separate from the
+    # hardware model — sharing one field meant switching to hardware silently
+    # left the simulation with an arm and nothing to pick up.
+    model: models/so101/pick_and_place_scene.xml
     viewer: false
 llm:
   provider: cli

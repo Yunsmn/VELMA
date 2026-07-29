@@ -13,13 +13,15 @@ Because lerobot pulls in torch, and torch has no Python 3.14 wheels, this backen
 only runs under the 3.12 interpreter that has lerobot installed. The MuJoCo model
 is used for KINEMATICS ONLY (IK, forward kinematics); all motion goes to servos.
 
-FRAME ALIGNMENT — READ BEFORE TRUSTING ANY CARTESIAN MOTION: lerobot's calibrated
-joint zero and sign do not necessarily match the MuJoCo model's joint convention.
-JOINT_SIGN and JOINT_OFFSET_DEG map model angles <-> servo degrees and are still
-IDENTITY, i.e. unmeasured. Until they are measured joint by joint, `get_state()`'s
-end_effector_m and anything driven by IK are not to be believed.
+FRAME ALIGNMENT: lerobot's calibrated joint zero and sign do not match the MuJoCo
+model's convention, so JOINT_SIGN and JOINT_OFFSET_DEG map between them. BOTH ARE
+NOW MEASURED (see their definitions below), and the result was checked against
+data it was not fitted to: three poses recorded earlier with an object resting on
+the table agree on gripper height to 1.6 mm. Base-frame coordinates therefore
+mean the same thing here as in the simulation — the table is z=0 and an object at
+rest is z=0.015. `get_state()`'s end_effector_m can be believed.
 
-Three behaviours here differ deliberately from the simulation backend, because the
+Behaviours that differ deliberately from the simulation backend, because the
 consequences differ on a physical arm:
   * reset() does NOT move. In simulation it re-poses the scene; here it would swing
     the arm to HOME_DEG in a single goal write from wherever it happens to be.
@@ -27,8 +29,14 @@ consequences differ on a physical arm:
   * Torque is HELD on disconnect. lerobot's default cuts it, and the arm then sags
     under gravity (measured: elbow_flex fell ~11 deg on the first probe). Use
     `release()` to deliberately go limp, ideally from a low pose.
-  * Every deliberate move is interpolated, and the bus enforces a per-command
-    relative clamp, so no single write can command a large jump.
+  * Motion is by GOAL, not by software ramp: publish the target and let the servo's
+    own position loop run. Interpolating in software rate-limited the arm badly.
+  * Cartesian targets are solved in the model and commanded once (`move_to_xyz`).
+    The simulation's approach of iterating small increments against the robot
+    stalls here, because the increments fall below the servo stiction floor.
+  * pad_contacts/grip_metrics answer with real signals and are COARSER than the
+    simulator's: there is no per-pad contact sensing, so a one-pad graze cannot be
+    distinguished from a proper bracket.
 """
 from __future__ import annotations
 
@@ -178,6 +186,13 @@ GRIP_MAX_STEPS = 14
 # Do not sit clamped indefinitely. Overload trips on sustained current, so a
 # grip that is going nowhere should be reported rather than quietly held.
 GRIP_HOLD_WARN_S = 60.0
+
+# Finger-pad thickness, matching the simulation's constant, so the free-gap
+# figure means the same thing on both backends.
+PAD_THICKNESS_M = 0.0025
+# Gap between re-reads when answering "is this grip stable?". The simulator steps
+# physics and rewinds; hardware just watches for a moment.
+GRIP_SETTLE_INTERVAL_S = 0.05
 
 # Wrist camera. Index is discovered unless SO101_WRIST_CAM pins it.
 WRIST_CAM_ENV = "SO101_WRIST_CAM"
@@ -619,6 +634,169 @@ class HardwareBackend(RobotBackend):
             "shortfall_deg": round(abs(nominal_limit - end), 2),
             "stopped_by": stopped_by,
             "speed_deg_s": speed_deg_s,
+        }
+
+    def solve_ik(self, target_xyz, seed_deg=None, iters: int = 400,
+                 tol_m: float = 0.0015) -> dict:
+        """Solve IK for a base-frame target ENTIRELY IN THE MODEL. Moves nothing.
+
+        The simulation's move_to_cartesian iterates against the robot: command a
+        small joint increment, read back, repeat. That works in a simulator where
+        every increment executes exactly. On this arm the increments land near or
+        below the servo stiction floor (~1.5 deg), so the arm does not move, the
+        error never shrinks, and the loop exhausts its step budget having gone
+        nowhere — the "Max steps" failures.
+
+        Solving in the model instead turns a Cartesian target into ONE finished
+        joint configuration, which the goal-and-poll mover executes reliably.
+        Damped least squares keeps it stable near singularities; joint limits are
+        respected so the answer is one the arm can actually adopt.
+        """
+        target = np.asarray(target_xyz, dtype=float)
+        site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
+
+        scratch = mujoco.MjData(self.model)
+        if seed_deg is None:
+            self._sync_mujoco_state()
+            q = self.data.qpos[:5].copy()
+        else:
+            q = np.radians(np.asarray(seed_deg, dtype=float))
+
+        lo, hi = self.model.jnt_range[:5, 0], self.model.jnt_range[:5, 1]
+        damping = 1e-3
+        best_q, best_err = q.copy(), np.inf
+
+        for _ in range(iters):
+            scratch.qpos[:5] = q
+            mujoco.mj_forward(self.model, scratch)
+            err = target - scratch.site_xpos[site]
+            norm = float(np.linalg.norm(err))
+            if norm < best_err:
+                best_err, best_q = norm, q.copy()
+            if norm < tol_m:
+                break
+            jac = np.zeros((3, self.model.nv))
+            mujoco.mj_jacSite(self.model, scratch, jac, None, site)
+            J = jac[:, :5]
+            # damped least squares: J^T (J J^T + lambda I)^-1 err
+            dq = J.T @ np.linalg.solve(J @ J.T + damping * np.eye(3), err)
+            q = np.clip(q + dq, lo, hi)
+
+        model_deg = np.degrees(best_q)
+        servo_deg = self._model_rad_to_servo_deg(best_q)
+        return {
+            "reachable": bool(best_err < 0.01),
+            "residual_mm": round(best_err * 1000, 2),
+            "model_deg": {n: round(float(model_deg[i]), 2)
+                          for i, n in enumerate(JOINT_NAMES)},
+            "servo_deg": {n: round(float(servo_deg[i]), 2)
+                          for i, n in enumerate(JOINT_NAMES)},
+        }
+
+    def move_to_xyz(self, target_xyz, timeout_s: float = 12.0) -> dict:
+        """Solve IK in the model, then command the whole joint solution at once."""
+        sol = self.solve_ik(target_xyz)
+        if not sol["reachable"]:
+            return {"moved": False, "reason": "target not reachable", **sol}
+
+        move = self.goto_servo_angles(sol["servo_deg"], timeout_s=timeout_s)
+        self._sync_mujoco_state()
+        site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
+        reached = self.data.site_xpos[site].copy()
+        target = np.asarray(target_xyz, dtype=float)
+        return {
+            "moved": True,
+            "target_m": [round(float(v), 4) for v in target],
+            "reached_m": [round(float(v), 4) for v in reached],
+            "error_mm": round(float(np.linalg.norm(reached - target)) * 1000, 1),
+            "ik_residual_mm": sol["residual_mm"],
+            "joint_residual_deg": move["residual_deg"],
+            "stalled": move["stalled"],
+        }
+
+    # ── grasp-primitive support ───────────────────────────────────────────────
+    #
+    # The grasp primitive was written against the simulator and asks it questions
+    # only a simulator can answer: which finger pad is touching the object, and
+    # whether the grip survives a physics lookahead. Neither exists on hardware.
+    # What follows answers with the real signals available, and is explicit about
+    # where the answer is coarser than the simulator's — inventing per-pad data
+    # would make grasp's decisions look informed when they are not.
+
+    def jaw_gap_mm(self) -> float:
+        """Free gap between the finger pads, in mm, at the MEASURED jaw opening.
+
+        Jaw geometry belongs to the ARM, not to the object, and the MuJoCo model
+        describes the same printed gripper. So this poses a scratch copy of the
+        model at the opening the gripper servo actually reports and measures pad
+        to pad, exactly as the simulation does. No object truth is consulted.
+        """
+        scratch = mujoco.MjData(self.model)
+        scratch.qpos[:5] = self.data.qpos[:5]
+
+        lo, hi = self.model.jnt_range[5]
+        pct = float(np.clip(self._read_gripper_pct(), 0.0, 100.0))
+        scratch.qpos[5] = lo + (hi - lo) * pct / 100.0
+        mujoco.mj_forward(self.model, scratch)
+
+        static_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                      "static_finger_pad")
+        moving_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                      "moving_finger_pad")
+        if static_id < 0 or moving_id < 0:
+            return 0.0
+        d = scratch.geom_xpos[moving_id] - scratch.geom_xpos[static_id]
+        inplane = float(np.hypot(d[0], d[1]))          # ignore the moving jaw's arc
+        return max(0.0, (inplane - PAD_THICKNESS_M) * 1000.0)
+
+    def pad_contacts(self) -> tuple[bool, bool]:
+        """(static_pad_touching, moving_pad_touching).
+
+        There is no per-pad sensor on this arm. The only contact evidence is the
+        gripper as a whole refusing to close, so BOTH entries carry the same
+        aggregate answer. A one-pad graze — which the simulator can see and which
+        grasp uses to decide whether to re-seat — is INVISIBLE here, so grasp will
+        treat an edge catch as a proper bracket. That is a real loss of fidelity,
+        not a shim, and it is why check_grip's quality reads are coarser on
+        hardware than in simulation.
+        """
+        grasped = self.is_grasping()
+        return grasped, grasped
+
+    def grip_metrics(self, settle_steps: int = 6) -> dict:
+        """Confidence read for check_grip, using measurements rather than physics.
+
+        The simulator answers `stable` by stepping a lookahead and rewinding. A
+        real arm cannot rewind, so stability is instead answered honestly: hold
+        the current command and RE-READ the gripper over a short window. If the
+        jaws are still held apart at the end, the grip survived; the object is not
+        disturbed because nothing is commanded to move.
+        """
+        static_pad, moving_pad = self.pad_contacts()
+        gap_mm = self.jaw_gap_mm()
+
+        holds = 0
+        n = max(1, int(settle_steps))
+        for _ in range(n):
+            time.sleep(GRIP_SETTLE_INTERVAL_S)
+            if self.is_grasping():
+                holds += 1
+        stable = holds >= n - 1          # tolerate a single flickering read
+
+        # Object width is INFERRED from where the jaws stalled, not looked up.
+        # Without a contact position there is nothing better available, and
+        # inspect_object's 30 mm default would be a fabricated number.
+        width_mm = gap_mm if (static_pad or moving_pad) else 0.0
+
+        return {
+            "is_grasping": self.is_grasping(),
+            "both_pads": static_pad and moving_pad,
+            "static_pad": static_pad,
+            "moving_pad": moving_pad,
+            "jaw_gap_mm": round(gap_mm, 2),
+            "object_width_mm": round(width_mm, 2),
+            "stable": stable,
+            "per_pad_sensing": False,     # tells callers the pads are an aggregate
         }
 
     def sample_pose(self) -> dict[str, float]:
