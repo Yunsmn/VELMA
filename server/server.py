@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -247,6 +248,278 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
             "wrist_roll": wrist_roll_deg,
         }.items() if v is not None}
         return _wrap(controller.set_joint_angles(angles), b)
+
+    # ── Wrist-camera perception + visual servoing (hardware) ──────────────────
+
+    # Measured on this arm 2026-07-29 by jogging one joint and tracking the
+    # target across frames (1280x720). Signs included:
+    #   shoulder_pan +13.27 deg  ->  du = -184 px   =>  -13.9 px/deg
+    #   wrist_flex   -12.31 deg  ->  dv = +176 px   =>  -14.3 px/deg
+    # These are a starting gain only. The loop is closed, so it corrects its own
+    # gain error; what matters is that the SIGNS are right.
+    PX_PER_DEG_PAN = -13.9
+    PX_PER_DEG_WRIST_FLEX = -14.3
+    CENTRE_TOLERANCE_PX = 25.0
+    # How far the target may plausibly move between iterations. One capped 8 deg
+    # jog shifts the image by roughly 110 px, so this allows that with margin
+    # while still rejecting a jump to a different object across the frame.
+    TRACK_GATE_PX = 260.0
+    # Smallest jog these servos answer reliably, and the jitter margin the
+    # divergence test needs. Both measured on this arm, not guessed.
+    MIN_EFFECTIVE_JOG_DEG = 1.5
+    DIVERGE_MARGIN = 1.05
+    SERVO_GAIN = 0.6          # under-relax: overshooting a real arm is worse than iterating
+    MAX_SERVO_STEP_DEG = 8.0
+
+    def _wrist_detections(max_results: int = 5):
+        import sys as _sys
+        from pathlib import Path as _Path
+        root = _Path(__file__).resolve().parents[1]
+        if str(root) not in _sys.path:
+            _sys.path.insert(0, str(root))
+        from perception import wrist_vision
+
+        render = getattr(b, "render_wrist", None)
+        if render is None:
+            raise RuntimeError("backend has no wrist camera")
+        rgb = render()
+        bgr = rgb[:, :, ::-1].copy()
+        return bgr, wrist_vision.detect(bgr, max_results=max_results), wrist_vision
+
+    @mcp.tool(description=(
+        "HARDWARE. Detect objects in the real wrist camera and report them in "
+        "IMAGE SPACE (pixel u,v, apparent radius, area) — deliberately NOT in "
+        "metres: one uncalibrated wrist view cannot support an honest metric "
+        "coordinate. Optionally saves an annotated PNG. Use with "
+        "center_object_in_view to drive the gripper onto a target."
+    ))
+    def detect_in_wrist_view(annotated_path: str = "", max_results: int = 5):
+        try:
+            bgr, dets, wv = _wrist_detections(max_results)
+        except Exception as e:
+            return [json.dumps({"status": "error",
+                                "message": f"{type(e).__name__}: {e}"}, indent=2)]
+        height, width = bgr.shape[:2]
+        out = {
+            "status": "success",
+            "frame": {"width": width, "height": height,
+                      "centre_uv": [width // 2, height // 2]},
+            "n_detections": len(dets),
+            "detections": [d.as_dict() for d in dets],
+        }
+        if annotated_path:
+            PILImage.fromarray(wv.annotate(bgr, dets)[:, :, ::-1]).save(annotated_path)
+            out["annotated_path"] = annotated_path
+        return [json.dumps(out, indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE. Closed-loop visual servo: repeatedly detect the strongest "
+        "target in the wrist camera and jog shoulder_pan (horizontal) and "
+        "wrist_flex (vertical) until it is centred in the frame. Needs no "
+        "kinematic model and no calibrated joint offsets — it closes the loop on "
+        "what the camera sees, which is why it works while the model<->servo "
+        "mapping is still unmeasured. Returns the pixel error at each iteration."
+    ))
+    def center_object_in_view(max_iters: int = 8, tolerance_px: float = 0.0,
+                              require_circular: bool = True):
+        mover = getattr(b, "move_joint_servo_delta", None)
+        if mover is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        tol = tolerance_px if tolerance_px > 0 else CENTRE_TOLERANCE_PX
+        history: List[dict] = []
+        last_uv: Optional[tuple] = None
+
+        for i in range(int(max_iters)):
+            try:
+                bgr, dets, _ = _wrist_detections(max_results=3)
+            except Exception as e:
+                return [json.dumps({"status": "error", "iteration": i,
+                                    "message": f"{type(e).__name__}: {e}",
+                                    "history": history}, indent=2)]
+            # "Not the background" is the right test on a bare table but not on a
+            # cluttered desk, where a laptop and a dock are just as much not-table
+            # as the target is. Shape is the cheap discriminator available here:
+            # the adapter takes a circle fit and the rectangular clutter does not.
+            if require_circular:
+                circular = [d for d in dets if d.circular]
+                if circular:
+                    dets = circular
+
+            if not dets:
+                return [json.dumps({"status": "lost", "iteration": i,
+                                    "message": "no target in view",
+                                    "history": history}, indent=2)]
+
+            height, width = bgr.shape[:2]
+
+            # Lock onto the SAME object across iterations. Re-picking the
+            # strongest detection every frame lets the loop jump to whatever
+            # else is in view — here a dark clamp at the frame edge, which
+            # intermittently outscored the target and threw the error from
+            # ~160 px back to ~600 px. Once a target is acquired, prefer the
+            # detection nearest to where it was last seen.
+            if last_uv is None:
+                target = dets[0]
+            else:
+                near = [d for d in dets
+                        if np.hypot(d.u - last_uv[0], d.v - last_uv[1]) <= TRACK_GATE_PX]
+                target = min(near,
+                             key=lambda d: np.hypot(d.u - last_uv[0], d.v - last_uv[1])) \
+                    if near else dets[0]
+            last_uv = (target.u, target.v)
+
+            err_u = target.u - width / 2.0
+            err_v = target.v - height / 2.0
+            err = float(np.hypot(err_u, err_v))
+            step = {"iteration": i, "u": round(target.u, 1), "v": round(target.v, 1),
+                    "err_u": round(err_u, 1), "err_v": round(err_v, 1),
+                    "err_px": round(err, 1), "radius_px": round(target.radius_px, 1)}
+
+            if err <= tol:
+                step["converged"] = True
+                history.append(step)
+                return [json.dumps({"status": "success", "converged": True,
+                                    "iterations": i + 1, "final_err_px": round(err, 1),
+                                    "history": history}, indent=2)]
+
+            # Divergence guard. A wrong gain sign turns this loop into something
+            # that walks the arm steadily away from the target; without this it
+            # will happily keep going until it runs out of iterations. Two
+            # consecutive increases is enough to call it and stop. The margin
+            # keeps detector jitter of a few pixels from reading as divergence —
+            # without it, an error sitting flat at 66 px tripped the guard.
+            if (len(history) >= 2
+                    and err > history[-1]["err_px"] * DIVERGE_MARGIN
+                    and history[-1]["err_px"] > history[-2]["err_px"] * DIVERGE_MARGIN):
+                step["diverging"] = True
+                history.append(step)
+                return [json.dumps({
+                    "status": "diverging",
+                    "message": ("pixel error grew for three readings running — "
+                                "the gain sign is wrong for this configuration; "
+                                "stopped rather than driving the target further out"),
+                    "history": history}, indent=2)]
+
+            # Null the error: the jog must produce du = -err_u, so the required
+            # angle is -err_u / (du/dangle). The negation is the whole control
+            # law — dropping it drives the target OUT of frame, which is exactly
+            # what happened the first time this ran.
+            d_pan = float(np.clip(-SERVO_GAIN * err_u / PX_PER_DEG_PAN,
+                                  -MAX_SERVO_STEP_DEG, MAX_SERVO_STEP_DEG))
+            d_flex = float(np.clip(-SERVO_GAIN * err_v / PX_PER_DEG_WRIST_FLEX,
+                                   -MAX_SERVO_STEP_DEG, MAX_SERVO_STEP_DEG))
+            step["jog"] = {"shoulder_pan": round(d_pan, 2),
+                           "wrist_flex": round(d_flex, 2)}
+
+            # Below roughly a degree and a half these servos stick rather than
+            # move (the same stiction that answered a request for 8 deg with
+            # 1.7). Once the correction the loop wants is smaller than what the
+            # arm can actually deliver, more iterations cannot help: say so
+            # instead of spinning, or worse, reading the noise as divergence.
+            if abs(d_pan) < MIN_EFFECTIVE_JOG_DEG and abs(d_flex) < MIN_EFFECTIVE_JOG_DEG:
+                step["at_resolution_limit"] = True
+                history.append(step)
+                return [json.dumps({
+                    "status": "resolution_limit",
+                    "converged": False,
+                    "final_err_px": round(err, 1),
+                    "message": (f"corrections needed ({d_pan:+.1f}, {d_flex:+.1f} deg) "
+                                f"are below the ~{MIN_EFFECTIVE_JOG_DEG} deg this arm "
+                                "delivers reliably; this is the mechanical floor, not "
+                                "a control failure"),
+                    "history": history}, indent=2)]
+
+            history.append(step)
+
+            if abs(d_pan) > 0.2:
+                mover("shoulder_pan", d_pan)
+            if abs(d_flex) > 0.2:
+                mover("wrist_flex", d_flex)
+
+        return [json.dumps({"status": "max_iters", "converged": False,
+                            "history": history}, indent=2)]
+
+    # ── Servo-space jogging (hardware only) ───────────────────────────────────
+
+    @mcp.tool(description=(
+        "HARDWARE ONLY. Move ONE joint by a relative delta in SERVO degrees, "
+        "bypassing the kinematic model's joint limits (which describe the model's "
+        "convention, not the real arm's). Use this to jog or recover the arm while "
+        "the model<->servo mapping is still unmeasured. joint is one of "
+        "shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper. "
+        "Capped at 30 deg per request; re-issued internally until the servo settles."
+    ))
+    def jog_joint(joint: str, delta_deg: float):
+        mover = getattr(b, "move_joint_servo_delta", None)
+        if mover is None:
+            return [json.dumps({
+                "status": "unsupported",
+                "message": "Servo-space jogging needs the hardware backend.",
+            }, indent=2)]
+        try:
+            return [json.dumps({"status": "success", **mover(joint, float(delta_deg))},
+                               indent=2)]
+        except ValueError as e:
+            return [json.dumps({"status": "error", "message": str(e)}, indent=2)]
+
+    # ── Hand guiding (hardware only) ──────────────────────────────────────────
+
+    @mcp.tool(description=(
+        "HARDWARE ONLY. Energise (enabled=true) or release (enabled=false) the "
+        "servos. Releasing lets a human move the arm by hand. WARNING: a released "
+        "arm is no longer holding itself up and will sag under gravity — support "
+        "it before calling this with enabled=false."
+    ))
+    def set_torque(enabled: bool):
+        setter = getattr(b, "set_torque", None)
+        if setter is None:
+            return [json.dumps({
+                "status": "unsupported",
+                "message": "This backend has no servos to energise (simulation).",
+            }, indent=2)]
+        return [json.dumps({"status": "success", **setter(enabled)}, indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE ONLY. Watch the arm for `seconds`, sampling joint angles at "
+        "`hz`, and return the trajectory plus the total change per joint. Intended "
+        "for hand guiding: release torque, move the arm, and read what moved. "
+        "Reports raw servo degrees — no kinematic model is involved."
+    ))
+    def observe_hand_motion(seconds: float = 10.0, hz: float = 10.0):
+        sampler = getattr(b, "sample_pose", None)
+        if sampler is None:
+            return [json.dumps({
+                "status": "unsupported",
+                "message": "This backend cannot sample real servo positions.",
+            }, indent=2)]
+
+        seconds = float(np.clip(seconds, 0.5, 120.0))
+        hz = float(np.clip(hz, 1.0, 50.0))
+        samples: List[dict] = []
+        t_end = time.time() + seconds
+        while time.time() < t_end:
+            samples.append({"t": round(time.time(), 3), **sampler()})
+            time.sleep(1.0 / hz)
+
+        if not samples:
+            return [json.dumps({"status": "error", "message": "no samples"}, indent=2)]
+
+        first, last = samples[0], samples[-1]
+        axes = [k for k in first if k != "t"]
+        t0 = first["t"]
+        return [json.dumps({
+            "status": "success",
+            "n_samples": len(samples),
+            "duration_s": round(last["t"] - t0, 2),
+            "start_deg": {a: round(first[a], 2) for a in axes},
+            "end_deg": {a: round(last[a], 2) for a in axes},
+            "change_deg": {a: round(last[a] - first[a], 2) for a in axes},
+            "range_deg": {a: round(max(s[a] for s in samples)
+                                  - min(s[a] for s in samples), 2) for a in axes},
+            "trajectory": [{"t": round(s["t"] - t0, 2),
+                            **{a: round(s[a], 1) for a in axes}} for s in samples],
+        }, indent=2)]
 
     # ── Harness only (testing/eval, not a manipulation verb) ──────────────────
 

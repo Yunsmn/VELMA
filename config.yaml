@@ -1,7 +1,12 @@
 backend:
-  type: simulation
+  type: hardware
+  hardware:
+    port: /dev/ttyACM0
+    id: my_follower_arm
   simulation:
-    model: models/so101/pick_and_place_scene.xml
+    # Arm only: on hardware this model is used for kinematics (IK/FK), so it must
+    # not carry scene objects the real table does not have.
+    model: models/so101/so101_new_calib.xml
     viewer: false
 llm:
   provider: cli

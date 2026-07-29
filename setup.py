@@ -28,7 +28,7 @@ DEFAULTS = {
     "backend": {
         "type": "simulation",
         "simulation": {"model": "models/so101/pick_and_place_scene.xml", "viewer": False},
-        "hardware": {"port": "/dev/ttyUSB0", "calibration": "calibration.json"},
+        "hardware": {"port": "/dev/ttyACM0", "id": "my_follower_arm"},
     },
     "llm": {"provider": "none", "model": "", "api_key_env": ""},
     "server": {"transport": "http", "port": 3001},
@@ -113,20 +113,23 @@ def configure_backend(cfg: dict) -> dict:
     else:
         current_port = _get(cfg, "backend", "hardware", "port",
                             default=DEFAULTS["backend"]["hardware"]["port"])
-        current_cal = _get(cfg, "backend", "hardware", "calibration",
-                           default=DEFAULTS["backend"]["hardware"]["calibration"])
+        current_id = _get(cfg, "backend", "hardware", "id",
+                          default=DEFAULTS["backend"]["hardware"]["id"])
 
         port = questionary.text("Serial port:", default=current_port).ask()
-        cal = questionary.text("Calibration file:", default=current_cal).ask()
+        robot_id = questionary.text(
+            "Robot id (the --robot.id you calibrated with):", default=current_id).ask()
 
-        if not Path(cal).exists():
-            console.print(f"[yellow]  !  '{cal}' not found — run calibration before starting.[/yellow]")
+        console.print(
+            f"  Calibration is loaded by lerobot from its cache for id '{robot_id}'. Run "
+            f"`lerobot-calibrate --robot.type=so101_follower --robot.port={port} "
+            f"--robot.id={robot_id}` first if you have not.")
 
         cfg.setdefault("backend", {})
         cfg["backend"]["type"] = "hardware"
         cfg["backend"].setdefault("hardware", {})
         cfg["backend"]["hardware"]["port"] = port
-        cfg["backend"]["hardware"]["calibration"] = cal
+        cfg["backend"]["hardware"]["id"] = robot_id
 
     return cfg
 

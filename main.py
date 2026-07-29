@@ -8,8 +8,14 @@ import time
 from pathlib import Path
 
 # Add the project venv's site-packages so the script works without activating first.
-_site = next(Path(__file__).parent.glob("venv/lib/python*/site-packages"), None)
-if _site and str(_site) not in sys.path:
+# Only when it matches the RUNNING interpreter: the hardware backend needs lerobot
+# (and so torch), which has no Python 3.14 wheels, so that backend runs under a 3.12
+# interpreter instead. Injecting a 3.14 site-packages there would put extension
+# modules built for the wrong ABI ahead of the real ones on sys.path.
+_site = Path(__file__).parent / (
+    f"venv/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+)
+if _site.is_dir() and str(_site) not in sys.path:
     sys.path.insert(0, str(_site))
 
 # The offscreen renderer (render_side/render_wrist, find_object, the run recorder)
@@ -78,8 +84,8 @@ def main() -> None:
         hw = backend_cfg.get("hardware", {})
         from robot.backends.hardware import HardwareBackend
         backend = HardwareBackend(model, data,
-                                  port=hw.get("port", "/dev/ttyUSB0"),
-                                  calibration=hw.get("calibration", "calibration.json"))
+                                  port=hw.get("port", "/dev/ttyACM0"),
+                                  robot_id=hw.get("id", "my_follower_arm"))
 
     backend.reset()
 
