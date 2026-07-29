@@ -1,7 +1,7 @@
 backend:
   type: hardware
   hardware:
-    port: /dev/ttyACM0
+    port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6056353-if00
     id: my_follower_arm
   simulation:
     # Arm only: on hardware this model is used for kinematics (IK/FK), so it must

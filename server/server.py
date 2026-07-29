@@ -440,6 +440,29 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
         return [json.dumps({"status": "max_iters", "converged": False,
                             "history": history}, indent=2)]
 
+    @mcp.tool(description=(
+        "HARDWARE. Close the jaws onto an object: step in until they meet "
+        "resistance, then hold with a small bounded squeeze at REDUCED torque. "
+        "Use this instead of set_gripper(0) to grasp — commanding a full close "
+        "onto a rigid object leaves the servo stalled at full effort, which "
+        "burned out the gripper motor once already. Reports contact position, "
+        "load, and whether a grip was actually detected."
+    ))
+    def close_on_object():
+        closer = getattr(b, "close_on_object", None)
+        if closer is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success", **closer()}, indent=2)]
+
+    @mcp.tool(description="HARDWARE. Open the jaws and release whatever is held.")
+    def release_object(open_to_pct: float = 70.0):
+        releaser = getattr(b, "release_object", None)
+        if releaser is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success", **releaser(open_to_pct)}, indent=2)]
+
     # ── Servo-space jogging (hardware only) ───────────────────────────────────
 
     @mcp.tool(description=(
@@ -471,14 +494,17 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
         "arm is no longer holding itself up and will sag under gravity — support "
         "it before calling this with enabled=false."
     ))
-    def set_torque(enabled: bool):
+    def set_torque(enabled: bool, joints: Optional[List[str]] = None):
         setter = getattr(b, "set_torque", None)
         if setter is None:
             return [json.dumps({
                 "status": "unsupported",
                 "message": "This backend has no servos to energise (simulation).",
             }, indent=2)]
-        return [json.dumps({"status": "success", **setter(enabled)}, indent=2)]
+        try:
+            return [json.dumps({"status": "success", **setter(enabled, joints)}, indent=2)]
+        except ValueError as e:
+            return [json.dumps({"status": "error", "message": str(e)}, indent=2)]
 
     @mcp.tool(description=(
         "HARDWARE ONLY. Watch the arm for `seconds`, sampling joint angles at "

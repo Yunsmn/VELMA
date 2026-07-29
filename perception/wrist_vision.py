@@ -16,6 +16,7 @@ Pure OpenCV: no torch, so it runs in the same interpreter as the MCP server.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -24,10 +25,21 @@ import numpy as np
 
 # The gripper's own jaws occupy the bottom of the wrist view and are pale
 # plastic; excluded so they are never picked as the target.
-GRIPPER_BAND_FRAC = 0.62
+#
+# How far up the frame they reach depends on the arm's posture. With the arm
+# raised and the camera looking steeply down, the target sits LOW in the frame —
+# at 0.62 the mask was clipping the adapter itself and detection failed outright.
+# The jaws are pale and score poorly against a pale table anyway, so the band can
+# afford to be generous; override for an unusual posture if needed.
+GRIPPER_BAND_FRAC = float(os.environ.get("SO101_GRIPPER_BAND_FRAC", "0.80"))
 MIN_AREA_PX = 800
 MAX_AREA_FRAC = 0.35
-BACKGROUND_PERCENTILE = 96.0
+# Keeping only the top few percent of "unlike the table" pixels fails when one
+# high-contrast object is present: a dark laptop consumed the entire budget and
+# the low-contrast white adapter fell below the cut, so detection returned the
+# distractor and nothing else. A looser cut lets both survive; the area, aspect
+# and shape filters below do the real rejecting.
+BACKGROUND_PERCENTILE = 88.0
 MAX_ASPECT = 3.0          # rejects the power cable and other long thin streaks
 
 # Circle fit (the adapter is round; other targets simply won't fit one).

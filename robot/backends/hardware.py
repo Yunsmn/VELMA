@@ -32,12 +32,16 @@ consequences differ on a physical arm:
 """
 from __future__ import annotations
 
+import glob
+import logging
 import os
 import time
 from typing import Optional
 
 import mujoco
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from robot.interface import RobotBackend
 from robot.state import RobotState
@@ -80,7 +84,14 @@ HOME_GRIPPER_PCT = 100.0
 
 # Largest position jump a single command may request, in degrees. lerobot clamps
 # each action against the present position, so this bounds servo speed too.
-MAX_RELATIVE_TARGET_DEG = 8.0
+#
+# It also bounds FORCE: the servo's position P-controller drives in proportion to
+# the goal-minus-present error, so a tight clamp caps how hard it can push. At
+# 8 deg this arm could not lift its own weight — elbow_flex answered a request
+# for -8 deg (against gravity) with -1.3, while +8 deg (with gravity) gave +7.0.
+# Widening the clamp restores authority without touching Max_Torque_Limit, which
+# lerobot sets to 50% and which still protects the motor from burnout.
+MAX_RELATIVE_TARGET_DEG = float(os.environ.get("SO101_MAX_REL_TARGET_DEG", "20.0"))
 
 # Deliberate ramped moves (move_home, move_gripper, release).
 RAMP_HZ = 30.0
@@ -89,11 +100,38 @@ DEFAULT_RAMP_S = 2.5
 # Largest relative move a single move_joint_servo_delta request may ask for.
 MAX_JOINT_DELTA_DEG = 30.0
 
-# is_grasping: the gripper is commanded shut but something holds the jaws apart.
-GRIP_CLOSED_PCT = 8.0          # below this the jaws are effectively touching
-GRIP_OBJECT_MIN_PCT = 3.0      # jaws stalled at least this far open
-GRIP_LOAD_MIN = 60             # raw Present_Load magnitude (0-1023), provisional
-_LOAD_MAGNITUDE_MASK = 0x3FF   # bit 10 is direction, not magnitude
+# Goal-and-poll motion. The servo runs its own position loop, so we publish the
+# goal and watch, rather than interpolating the trajectory in software.
+POLL_INTERVAL_S = 0.05        # 20 Hz goal refresh + readback
+ARRIVE_TOL_DEG = 0.8
+STALL_EPS_DEG = 0.15          # per-poll movement below this counts as no progress
+STALL_POLLS = 8               # ~0.4 s of no progress means it is not going further
+DEFAULT_MOVE_TIMEOUT_S = 8.0
+
+# Grasping.
+#
+# The first version of this asked whether the gripper was commanded below an
+# ABSOLUTE 8%, which is only reachable when the jaws are nearly touching. On a
+# 45 mm object that can never happen, so the only way to make it report a grip
+# was to command a full close and leave the servo stalled against the object.
+# Holding that stall burned out motor 6 — it dropped off the bus entirely and
+# needed a power cycle. The test is now RELATIVE (is the goal meaningfully
+# tighter than where the jaws actually are?), which works at any object size and
+# never requires a sustained stall.
+GRIP_OBJECT_MIN_PCT = 3.0       # jaws stalled at least this far open
+GRIP_STALL_MARGIN_PCT = 1.5     # goal must be this much tighter than actual
+GRIP_LOAD_MIN = 60              # raw Present_Load magnitude (0-1023), provisional
+_LOAD_MAGNITUDE_MASK = 0x3FF    # bit 10 is direction, not magnitude
+
+# Closing onto an object: step in until the jaws stop making progress (contact),
+# then hold with a small bounded squeeze at REDUCED torque, rather than leaving
+# the servo straining at full effort against something it can never reach.
+GRIP_STEP_PCT = 8.0
+GRIP_STALL_EPS_PCT = 0.8        # progress below this between steps means contact
+GRIP_SQUEEZE_PCT = 4.0          # how far past contact to hold
+GRIP_HOLD_TORQUE = 250          # Max_Torque_Limit while holding (lerobot uses 500)
+GRIP_MOVE_TORQUE = 500
+GRIP_MAX_STEPS = 14
 
 # Wrist camera. Index is discovered unless SO101_WRIST_CAM pins it.
 WRIST_CAM_ENV = "SO101_WRIST_CAM"
@@ -101,12 +139,37 @@ CAM_WIDTH, CAM_HEIGHT = 1280, 720
 CAM_WARMUP_FRAMES = 5          # USB cameras need a few frames to settle exposure
 
 
+def resolve_port(port: str) -> str:
+    """Return a serial port that exists, preferring a stable by-id path.
+
+    /dev/ttyACM<N> is assigned in plug order, so unplugging the arm or a USB
+    glitch renames it — this rig moved from ttyACM0 to ttyACM1 mid-session and
+    every call then failed with a misleading "Port is in use". The symlinks in
+    /dev/serial/by-id are keyed to the adapter's serial number and survive that,
+    so fall back to one when the configured path has gone missing.
+    """
+    if os.path.exists(port):
+        return port
+
+    by_id = "/dev/serial/by-id"
+    candidates = sorted(glob.glob(os.path.join(by_id, "*"))) if os.path.isdir(by_id) else []
+    if not candidates:
+        raise RuntimeError(
+            f"{port} does not exist and no serial adapter was found under {by_id}. "
+            "Is the arm plugged in and powered?"
+        )
+    resolved = os.path.realpath(candidates[0])
+    logger.warning("serial port %s is gone; using %s (%s)",
+                   port, resolved, os.path.basename(candidates[0]))
+    return resolved
+
+
 class HardwareBackend(RobotBackend):
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
                  port: str = "/dev/ttyACM0", robot_id: str = "my_follower_arm"):
         self.model = model
         self.data = data
-        self.port = port
+        self.port = port = resolve_port(port)
         self.robot_id = robot_id
 
         try:
@@ -131,6 +194,11 @@ class HardwareBackend(RobotBackend):
         self._camera = None
         self._camera_index: Optional[int] = None
         self._last_gripper_cmd_pct = self._read_gripper_pct()
+        # The gripper's GOAL, which must survive arm motion. _send writes all six
+        # axes on every call, so moving an arm joint used to overwrite the gripper
+        # goal with wherever the jaws currently are — silently cancelling the
+        # squeeze and dropping the grip the moment the arm moved.
+        self._gripper_goal_pct = self._last_gripper_cmd_pct
         self._torque_enabled = True  # connect() energises the servos
 
         # Hardware has no ground truth for object poses; these hold the most recent
@@ -198,7 +266,7 @@ class HardwareBackend(RobotBackend):
         self._sync_mujoco_state()
 
     def move_joint_servo_delta(self, joint: str, delta_deg: float,
-                               secs: float = 2.5, settle_tries: int = 6) -> dict:
+                               timeout_s: float = DEFAULT_MOVE_TIMEOUT_S) -> dict:
         """Ramp ONE joint by a relative delta in SERVO degrees.
 
         This deliberately bypasses the MuJoCo model's joint limits. Those limits
@@ -223,15 +291,39 @@ class HardwareBackend(RobotBackend):
 
         start = self._read_all()
         target = start[joint] + delta_deg
+        hold = dict(start)
+        if joint != "gripper":
+            # Keep squeezing whatever is held, rather than re-commanding the jaws
+            # to their present position and letting go.
+            hold["gripper"] = self._gripper_goal_pct
+        else:
+            self._gripper_goal_pct = target
 
+        # Drive by GOAL, not by a software ramp. Feeding the servo 75
+        # interpolated setpoints at 30 Hz and then retrying that up to six times
+        # meant a single jog could spend 15 s travelling 3 degrees — the motion
+        # was rate-limited by us, not by the motor. Instead: publish the goal and
+        # let the servo's own position controller run at its speed, refreshing
+        # the goal (lerobot clamps it to MAX_RELATIVE_TARGET ahead of present) and
+        # polling until it either arrives or stops making progress.
+        deadline = time.time() + timeout_s
         previous = start[joint]
-        for _ in range(settle_tries):
-            self._ramp_to({joint: target}, secs=secs)
+        stalled_polls = 0
+        while time.time() < deadline:
+            blended = {**hold, joint: target}
+            self._send(np.array([blended[j] for j in JOINT_NAMES]), blended["gripper"])
+            time.sleep(POLL_INTERVAL_S)
+
             reached = self._read_all()[joint]
-            if abs(reached - target) <= 1.0 or abs(reached - previous) < 0.3:
-                break  # arrived, or stopped making progress (stall / hard stop)
+            if abs(reached - target) <= ARRIVE_TOL_DEG:
+                break
+            if abs(reached - previous) < STALL_EPS_DEG:
+                stalled_polls += 1
+                if stalled_polls >= STALL_POLLS:
+                    break  # hard stop, or gravity/torque limit — stop pushing
+            else:
+                stalled_polls = 0
             previous = reached
-            secs = 1.0  # already close; top up quickly
 
         end = self._read_all()
         return {
@@ -244,6 +336,71 @@ class HardwareBackend(RobotBackend):
             "shortfall_deg": round(target - end[joint], 2),
             "pose_deg": {k: round(v, 2) for k, v in end.items()},
         }
+
+    def _set_gripper_torque_limit(self, value: int) -> None:
+        try:
+            self.robot.bus.write("Max_Torque_Limit", "gripper", int(value))
+        except Exception:
+            logger.warning("could not set gripper Max_Torque_Limit", exc_info=True)
+
+    def close_on_object(self) -> dict:
+        """Close the jaws until they meet resistance, then hold gently.
+
+        Steps inward and watches for the jaws to stop moving. That stall is
+        contact. Once found, the goal is set a small fixed amount past contact
+        and the gripper's torque limit is dropped, so the hold is a light squeeze
+        rather than a servo straining indefinitely at full effort — which is what
+        destroyed motor 6 the first time round.
+        """
+        self._set_gripper_torque_limit(GRIP_MOVE_TORQUE)
+        previous = self._read_gripper_pct()
+        contact_pct: Optional[float] = None
+
+        for _ in range(GRIP_MAX_STEPS):
+            target = max(0.0, previous - GRIP_STEP_PCT)
+            self.move_joint_servo_delta("gripper", target - previous)
+            actual = self._read_gripper_pct()
+
+            if abs(actual - previous) < GRIP_STALL_EPS_PCT:
+                contact_pct = actual
+                break
+            previous = actual
+            if actual <= 0.5:
+                break  # fully closed without meeting anything
+
+        actual = self._read_gripper_pct()
+        if contact_pct is None:
+            self._set_gripper_torque_limit(GRIP_HOLD_TORQUE)
+            return {"grasped": False, "reason": "jaws closed without meeting an object",
+                    "gripper_pct": round(actual, 1)}
+
+        # Bounded squeeze, then ease off the torque for the hold.
+        hold_goal = max(0.0, contact_pct - GRIP_SQUEEZE_PCT)
+        self._gripper_goal_pct = hold_goal
+        self._send(self._read_joints_deg(), hold_goal)
+        time.sleep(0.3)
+        self._set_gripper_torque_limit(GRIP_HOLD_TORQUE)
+
+        return {
+            "grasped": self.is_grasping(),
+            "contact_pct": round(contact_pct, 1),
+            "hold_goal_pct": round(hold_goal, 1),
+            "gripper_pct": round(self._read_gripper_pct(), 1),
+            "load": self._gripper_load(),
+            "hold_torque_limit": GRIP_HOLD_TORQUE,
+        }
+
+    def release_object(self, open_to_pct: float = 70.0) -> dict:
+        self._set_gripper_torque_limit(GRIP_MOVE_TORQUE)
+        self._gripper_goal_pct = open_to_pct
+        self.move_joint_servo_delta("gripper", open_to_pct - self._read_gripper_pct())
+        return {"gripper_pct": round(self._read_gripper_pct(), 1)}
+
+    def _gripper_load(self) -> Optional[int]:
+        try:
+            return int(self.robot.bus.read("Present_Load", "gripper")) & _LOAD_MAGNITUDE_MASK
+        except Exception:
+            return None
 
     def sample_pose(self) -> dict[str, float]:
         """One raw servo reading, no MuJoCo involved. Used to watch the arm while
@@ -294,9 +451,9 @@ class HardwareBackend(RobotBackend):
         corroborates it; its threshold is provisional and wants tuning against a
         known object before anything depends on it.
         """
-        if self._last_gripper_cmd_pct > GRIP_CLOSED_PCT:
-            return False
         actual_pct = self._read_gripper_pct()
+        if self._last_gripper_cmd_pct > actual_pct - GRIP_STALL_MARGIN_PCT:
+            return False  # not pressing tighter than it already is
         if actual_pct < GRIP_OBJECT_MIN_PCT:
             return False  # jaws fully shut: nothing between them
         try:
@@ -405,26 +562,37 @@ class HardwareBackend(RobotBackend):
 
     # ── torque (lead-through / hand guiding) ──────────────────────────────────
 
-    def set_torque(self, enabled: bool) -> dict:
-        """Energise or release the arm's servos.
+    def set_torque(self, enabled: bool, joints: Optional[list[str]] = None) -> dict:
+        """Energise or release servos, all of them or a named subset.
 
-        Releasing lets the arm be moved BY HAND, which is how the model<->servo
-        convention gets measured without commanding a motion whose direction is
-        not yet known. It also means the arm is no longer holding itself up: it
-        WILL sag under gravity the instant torque drops, so it must be supported
-        first. Re-enabling holds wherever it is then resting.
+        Releasing lets the arm be moved BY HAND, which is how a known-good pose
+        gets captured without commanding a motion whose direction is not yet
+        known. It also means the arm is no longer holding itself up: it WILL sag
+        under gravity the instant torque drops, so it must be supported first.
+
+        The subset matters for hand-guided grasping: release the five arm joints
+        so the pose can be set by hand, but leave the GRIPPER energised so the
+        jaws can still be commanded shut on the object once it is in place.
         """
+        targets = joints if joints else ALL_AXES
+        unknown = set(targets) - set(ALL_AXES)
+        if unknown:
+            raise ValueError(f"unknown joints: {sorted(unknown)}; valid: {ALL_AXES}")
+
         if enabled:
-            self.robot.bus.enable_torque()
+            self.robot.bus.enable_torque(list(targets))
         else:
-            self.robot.bus.disable_torque()
-        self._torque_enabled = enabled
+            self.robot.bus.disable_torque(list(targets))
+        if not joints:
+            self._torque_enabled = enabled
+
         pose = self._read_all()
         return {
             "torque_enabled": enabled,
+            "affected_joints": list(targets),
             "joint_angles_deg": {k: round(v, 2) for k, v in pose.items()},
-            "note": ("Servos released — SUPPORT THE ARM, it will sag."
-                     if not enabled else "Servos holding at the current pose."),
+            "note": ("Released — SUPPORT THE ARM, it will sag."
+                     if not enabled else "Holding at the current pose."),
         }
 
     # ── shutdown ──────────────────────────────────────────────────────────────
