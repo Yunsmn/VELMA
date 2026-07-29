@@ -93,6 +93,16 @@ HOME_GRIPPER_PCT = 100.0
 # lerobot sets to 50% and which still protects the motor from burnout.
 MAX_RELATIVE_TARGET_DEG = float(os.environ.get("SO101_MAX_REL_TARGET_DEG", "20.0"))
 
+# Servo position-loop stiffness. lerobot writes P=16, which is soft: the arm
+# yields to gravity between commands, so every upward move begins by clawing
+# back sag that should never have happened, and lands short. Stiffer holding is
+# the fix for both the lag and the shortfall — it is a HOLDING problem, not a
+# trajectory problem. Raised here; D is left as lerobot sets it to damp the
+# oscillation a higher P would otherwise invite.
+POSITION_P = int(os.environ.get("SO101_POSITION_P", "32"))
+POSITION_I = int(os.environ.get("SO101_POSITION_I", "0"))
+POSITION_D = int(os.environ.get("SO101_POSITION_D", "32"))
+
 # Deliberate ramped moves (move_home, move_gripper, release).
 RAMP_HZ = 30.0
 DEFAULT_RAMP_S = 2.5
@@ -107,6 +117,12 @@ ARRIVE_TOL_DEG = 0.8
 STALL_EPS_DEG = 0.15          # per-poll movement below this counts as no progress
 STALL_POLLS = 8               # ~0.4 s of no progress means it is not going further
 DEFAULT_MOVE_TIMEOUT_S = 8.0
+
+# Smooth limit sweeps. The goal advances at a fixed rate so the servo follows a
+# moving setpoint rather than lunging at a distant one.
+SWEEP_SPEED_DEG_S = 12.0
+SWEEP_TIMEOUT_S = 25.0
+SWEEP_STALL_POLLS = 14      # ~0.7 s of no progress before calling it a limit
 
 # Grasping.
 #
@@ -201,6 +217,9 @@ class HardwareBackend(RobotBackend):
             use_degrees=True,
             max_relative_target=MAX_RELATIVE_TARGET_DEG,
             disable_torque_on_disconnect=False,
+            position_p_coefficient=POSITION_P,
+            position_i_coefficient=POSITION_I,
+            position_d_coefficient=POSITION_D,
         ))
         self.robot.connect(calibrate=False)
 
@@ -503,6 +522,86 @@ class HardwareBackend(RobotBackend):
             "reached_deg": {k: round(end[k], 2) for k in ALL_AXES},
             "residual_deg": {k: round(end[k] - goal[k], 2) for k in moving},
             "stalled": stalled_polls >= STALL_POLLS,
+        }
+
+    def calibrated_limits(self) -> dict[str, tuple[float, float]]:
+        """Each joint's calibrated travel, in servo degrees.
+
+        lerobot puts zero at the midpoint of the swept range, so the limits are
+        symmetric by construction: +-(span/2). Note these describe the sweep that
+        calibration happened to capture, and on this arm the joint limits are
+        COUPLED — what a joint can actually reach depends on where the others
+        are — so treat these as nominal and trust the measured stop instead.
+        """
+        limits = {}
+        for name, cal in self.robot.bus.calibration.items():
+            half = (cal.range_max - cal.range_min) / 2 * 360 / 4095
+            limits[name] = (-half, half)
+        return limits
+
+    def sweep_joint(self, joint: str, direction: int,
+                    speed_deg_s: float = SWEEP_SPEED_DEG_S,
+                    timeout_s: float = SWEEP_TIMEOUT_S) -> dict:
+        """Move one joint smoothly toward its limit and report where it stops.
+
+        The goal is advanced at a fixed rate rather than being thrown to the far
+        end: the servo then tracks a moving setpoint a small distance ahead,
+        which is what makes the motion continuous instead of a lurch followed by
+        a stall. Stops at the calibrated limit, when the joint stops making
+        progress (a real mechanical or torque limit), or on timeout.
+        """
+        if joint not in ALL_AXES:
+            raise ValueError(f"unknown joint {joint!r}; valid: {ALL_AXES}")
+        if direction not in (-1, 1):
+            raise ValueError("direction must be +1 or -1")
+
+        low, high = self.calibrated_limits()[joint]
+        nominal_limit = high if direction > 0 else low
+
+        start = self._read_all()
+        goal = start[joint]
+        hold = dict(start)
+        if joint != "gripper":
+            hold["gripper"] = self._gripper_goal_pct
+
+        deadline = time.time() + timeout_s
+        previous = start[joint]
+        stalled_polls = 0
+        stopped_by = "timeout"
+
+        while time.time() < deadline:
+            goal += direction * speed_deg_s * POLL_INTERVAL_S
+            goal = min(goal, nominal_limit) if direction > 0 else max(goal, nominal_limit)
+
+            blended = {**hold, joint: goal}
+            self._send(np.array([blended[j] for j in JOINT_NAMES]), blended["gripper"])
+            time.sleep(POLL_INTERVAL_S)
+
+            now = self._read_all()[joint]
+            if abs(now - previous) < STALL_EPS_DEG:
+                stalled_polls += 1
+                if stalled_polls >= SWEEP_STALL_POLLS:
+                    stopped_by = ("reached calibrated limit"
+                                  if abs(now - nominal_limit) < 2.0 else "stalled early")
+                    break
+            else:
+                stalled_polls = 0
+            previous = now
+
+            if abs(goal - nominal_limit) < 1e-6 and abs(now - nominal_limit) <= ARRIVE_TOL_DEG:
+                stopped_by = "reached calibrated limit"
+                break
+
+        end = self._read_all()[joint]
+        return {
+            "joint": joint,
+            "direction": "max" if direction > 0 else "min",
+            "start_deg": round(start[joint], 2),
+            "nominal_limit_deg": round(nominal_limit, 2),
+            "reached_deg": round(end, 2),
+            "shortfall_deg": round(abs(nominal_limit - end), 2),
+            "stopped_by": stopped_by,
+            "speed_deg_s": speed_deg_s,
         }
 
     def sample_pose(self) -> dict[str, float]:

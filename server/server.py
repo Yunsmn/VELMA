@@ -549,6 +549,41 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
         except ValueError as e:
             return [json.dumps({"status": "error", "message": str(e)}, indent=2)]
 
+    @mcp.tool(description=(
+        "HARDWARE. Move ONE joint smoothly toward its calibrated limit and report "
+        "where it actually stops. direction is \"max\" or \"min\". The goal is "
+        "advanced at a steady rate so the motion is continuous. Because this arm's "
+        "joint limits are COUPLED, the reachable stop depends on where the other "
+        "joints are, so the measured value matters more than the calibrated one."
+    ))
+    def sweep_joint_to_limit(joint: str, direction: str = "max",
+                             speed_deg_s: float = 12.0):
+        sweeper = getattr(b, "sweep_joint", None)
+        if sweeper is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        if direction not in ("max", "min"):
+            return [json.dumps({"status": "error",
+                                "message": "direction must be 'max' or 'min'"}, indent=2)]
+        try:
+            out = sweeper(joint, 1 if direction == "max" else -1,
+                          speed_deg_s=float(speed_deg_s))
+        except ValueError as e:
+            return [json.dumps({"status": "error", "message": str(e)}, indent=2)]
+        return [json.dumps({"status": "success", **out}, indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE. Report each joint's calibrated travel in servo degrees."
+    ))
+    def joint_limits():
+        getter = getattr(b, "calibrated_limits", None)
+        if getter is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success",
+                            "limits_deg": {k: [round(v[0], 2), round(v[1], 2)]
+                                           for k, v in getter().items()}}, indent=2)]
+
     # ── Servo-space jogging (hardware only) ───────────────────────────────────
 
     @mcp.tool(description=(
