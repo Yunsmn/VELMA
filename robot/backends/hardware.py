@@ -128,10 +128,23 @@ _LOAD_MAGNITUDE_MASK = 0x3FF    # bit 10 is direction, not magnitude
 # the servo straining at full effort against something it can never reach.
 GRIP_STEP_PCT = 8.0
 GRIP_STALL_EPS_PCT = 0.8        # progress below this between steps means contact
-GRIP_SQUEEZE_PCT = 4.0          # how far past contact to hold
-GRIP_HOLD_TORQUE = 250          # Max_Torque_Limit while holding (lerobot uses 500)
+# Squeeze and hold torque are both deliberately small. A 4% squeeze at torque
+# limit 250 still tripped the STS3215's overload protection after a few minutes
+# of holding a rigid object — the servo latched and dropped off the bus. Holding
+# TIME matters as much as force: the jaws are already mechanically closed around
+# the object, and the squeeze only adds stall current.
+# Balanced against BOTH failure modes seen on this arm: 4% at torque 250 tripped
+# overload after minutes of holding, while 1.5% at 130 was too weak and the
+# adapter was dropped mid-carry. The decisive variable is hold TIME, not force,
+# so this sits in between and the caller is expected to keep grips short.
+GRIP_SQUEEZE_PCT = 3.5          # how far past contact to hold
+GRIP_HOLD_TORQUE = 220          # Max_Torque_Limit while holding (lerobot uses 500)
 GRIP_MOVE_TORQUE = 500
 GRIP_MAX_STEPS = 14
+
+# Do not sit clamped indefinitely. Overload trips on sustained current, so a
+# grip that is going nowhere should be reported rather than quietly held.
+GRIP_HOLD_WARN_S = 60.0
 
 # Wrist camera. Index is discovered unless SO101_WRIST_CAM pins it.
 WRIST_CAM_ENV = "SO101_WRIST_CAM"
@@ -199,6 +212,7 @@ class HardwareBackend(RobotBackend):
         # goal with wherever the jaws currently are — silently cancelling the
         # squeeze and dropping the grip the moment the arm moved.
         self._gripper_goal_pct = self._last_gripper_cmd_pct
+        self._grip_started_at: Optional[float] = None
         self._torque_enabled = True  # connect() energises the servos
 
         # Hardware has no ground truth for object poses; these hold the most recent
@@ -376,6 +390,7 @@ class HardwareBackend(RobotBackend):
 
         # Bounded squeeze, then ease off the torque for the hold.
         hold_goal = max(0.0, contact_pct - GRIP_SQUEEZE_PCT)
+        self._grip_started_at = time.time()
         self._gripper_goal_pct = hold_goal
         self._send(self._read_joints_deg(), hold_goal)
         time.sleep(0.3)
@@ -390,10 +405,50 @@ class HardwareBackend(RobotBackend):
             "hold_torque_limit": GRIP_HOLD_TORQUE,
         }
 
+    def clear_gripper_overload(self) -> dict:
+        """Clear the gripper's latched overload-protection state.
+
+        Sustained stall current makes the STS3215 latch into overload: it keeps
+        answering pings with an error status and refuses to operate, so the whole
+        bus handshake fails and the server will not start. The latch releases
+        once the motor stops straining, so dropping Torque_Enable clears it
+        WITHOUT a power cycle — at the cost of letting go of anything held.
+        """
+        self.robot.bus.write("Torque_Enable", "gripper", 0, num_retry=3)
+        time.sleep(1.5)
+        self._grip_started_at = None
+        try:
+            self.robot.bus.write("Torque_Enable", "gripper", 1, num_retry=3)
+            self._set_gripper_torque_limit(GRIP_MOVE_TORQUE)
+            recovered = True
+        except Exception:
+            logger.warning("gripper did not re-enable after overload clear", exc_info=True)
+            recovered = False
+        return {"recovered": recovered,
+                "note": "Anything the gripper was holding has been released."}
+
+    def grip_hold_seconds(self) -> Optional[float]:
+        if self._grip_started_at is None:
+            return None
+        return round(time.time() - self._grip_started_at, 1)
+
     def release_object(self, open_to_pct: float = 70.0) -> dict:
+        """Open the jaws, in chunks if need be.
+
+        Opening from a grip to wide open is a bigger move than the per-request
+        cap allows, so asking for it in one go raised and left the object still
+        clamped — the failure that ended the first teach run. Split it instead.
+        """
+        self._grip_started_at = None
         self._set_gripper_torque_limit(GRIP_MOVE_TORQUE)
         self._gripper_goal_pct = open_to_pct
-        self.move_joint_servo_delta("gripper", open_to_pct - self._read_gripper_pct())
+
+        for _ in range(6):
+            remaining = open_to_pct - self._read_gripper_pct()
+            if abs(remaining) <= 1.0:
+                break
+            step = float(np.clip(remaining, -MAX_JOINT_DELTA_DEG, MAX_JOINT_DELTA_DEG))
+            self.move_joint_servo_delta("gripper", step)
         return {"gripper_pct": round(self._read_gripper_pct(), 1)}
 
     def _gripper_load(self) -> Optional[int]:
@@ -401,6 +456,54 @@ class HardwareBackend(RobotBackend):
             return int(self.robot.bus.read("Present_Load", "gripper")) & _LOAD_MAGNITUDE_MASK
         except Exception:
             return None
+
+    def goto_servo_angles(self, targets: dict[str, float],
+                          timeout_s: float = DEFAULT_MOVE_TIMEOUT_S) -> dict:
+        """Drive several joints to ABSOLUTE servo angles at once.
+
+        Moving joints together is both quicker and gentler than one at a time:
+        the arm sweeps a direct path instead of a staircase. Same goal-and-poll
+        approach as a single jog, and the gripper is left alone unless named, so
+        a held object keeps being held.
+        """
+        unknown = set(targets) - set(ALL_AXES)
+        if unknown:
+            raise ValueError(f"unknown joints: {sorted(unknown)}; valid: {ALL_AXES}")
+
+        start = self._read_all()
+        goal = {**start, **targets}
+        if "gripper" not in targets:
+            goal["gripper"] = self._gripper_goal_pct
+        else:
+            self._gripper_goal_pct = goal["gripper"]
+
+        moving = [j for j in targets if j != "gripper"]
+        deadline = time.time() + timeout_s
+        previous = {j: start[j] for j in moving}
+        stalled_polls = 0
+
+        while time.time() < deadline:
+            self._send(np.array([goal[j] for j in JOINT_NAMES]), goal["gripper"])
+            time.sleep(POLL_INTERVAL_S)
+
+            now = self._read_all()
+            if moving and max(abs(now[j] - goal[j]) for j in moving) <= ARRIVE_TOL_DEG:
+                break
+            if moving and max(abs(now[j] - previous[j]) for j in moving) < STALL_EPS_DEG:
+                stalled_polls += 1
+                if stalled_polls >= STALL_POLLS:
+                    break
+            else:
+                stalled_polls = 0
+            previous = {j: now[j] for j in moving}
+
+        end = self._read_all()
+        return {
+            "target_deg": {k: round(v, 2) for k, v in targets.items()},
+            "reached_deg": {k: round(end[k], 2) for k in ALL_AXES},
+            "residual_deg": {k: round(end[k] - goal[k], 2) for k in moving},
+            "stalled": stalled_polls >= STALL_POLLS,
+        }
 
     def sample_pose(self) -> dict[str, float]:
         """One raw servo reading, no MuJoCo involved. Used to watch the arm while

@@ -455,6 +455,19 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
                                 "message": "needs the hardware backend"}, indent=2)]
         return [json.dumps({"status": "success", **closer()}, indent=2)]
 
+    @mcp.tool(description=(
+        "HARDWARE. Clear the gripper's latched overload-protection state. "
+        "Sustained stall current makes the servo latch: it answers pings with an "
+        "error, the bus handshake fails, and the server will not start. Dropping "
+        "torque clears it without a power cycle — but it RELEASES anything held."
+    ))
+    def clear_gripper_overload():
+        clearer = getattr(b, "clear_gripper_overload", None)
+        if clearer is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success", **clearer()}, indent=2)]
+
     @mcp.tool(description="HARDWARE. Open the jaws and release whatever is held.")
     def release_object(open_to_pct: float = 70.0):
         releaser = getattr(b, "release_object", None)
@@ -462,6 +475,79 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
             return [json.dumps({"status": "unsupported",
                                 "message": "needs the hardware backend"}, indent=2)]
         return [json.dumps({"status": "success", **releaser(open_to_pct)}, indent=2)]
+
+    # ── Taught poses (hardware) ───────────────────────────────────────────────
+
+    from robot.pose_store import PoseStore
+    _poses = PoseStore()
+
+    @mcp.tool(description=(
+        "HARDWARE. Record the arm's CURRENT joint angles under a name, so it can "
+        "be returned to later. Poses are stored in SERVO degrees, which are read "
+        "straight off the encoders and do not depend on the unmeasured "
+        "model<->servo offsets — so a pose taught now still replays correctly if "
+        "the kinematic mapping is fixed later. The gripper opening is saved too."
+    ))
+    def save_pose(name: str, note: str = ""):
+        sampler = getattr(b, "sample_pose", None)
+        if sampler is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        return [json.dumps({"status": "success", **_poses.save(name, sampler(), note)},
+                           indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE. Move the arm to a previously saved pose. By default the "
+        "gripper is NOT moved, so an object being carried stays held; pass "
+        "include_gripper=true to also restore the saved jaw opening."
+    ))
+    def goto_pose(name: str, include_gripper: bool = False):
+        mover = getattr(b, "goto_servo_angles", None)
+        if mover is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        try:
+            entry = _poses.get(name)
+        except KeyError as e:
+            return [json.dumps({"status": "error", "message": str(e)}, indent=2)]
+
+        targets = dict(entry["angles_deg"])
+        if not include_gripper:
+            targets.pop("gripper", None)
+        return [json.dumps({"status": "success", "pose": name,
+                            **mover(targets)}, indent=2)]
+
+    @mcp.tool(description="HARDWARE. List every saved pose with its angles and note.")
+    def list_poses():
+        return [json.dumps({"status": "success", "poses": _poses.list()}, indent=2)]
+
+    @mcp.tool(description=(
+        "HARDWARE. Move joints to ABSOLUTE servo angles (degrees). Any joint left "
+        "unspecified holds station. The gripper is untouched unless named, so a "
+        "held object keeps being held."
+    ))
+    def goto_servo_angles(shoulder_pan_deg: Optional[float] = None,
+                          shoulder_lift_deg: Optional[float] = None,
+                          elbow_flex_deg: Optional[float] = None,
+                          wrist_flex_deg: Optional[float] = None,
+                          wrist_roll_deg: Optional[float] = None,
+                          gripper_pct: Optional[float] = None):
+        mover = getattr(b, "goto_servo_angles", None)
+        if mover is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        targets = {k: v for k, v in {
+            "shoulder_pan": shoulder_pan_deg, "shoulder_lift": shoulder_lift_deg,
+            "elbow_flex": elbow_flex_deg, "wrist_flex": wrist_flex_deg,
+            "wrist_roll": wrist_roll_deg, "gripper": gripper_pct,
+        }.items() if v is not None}
+        if not targets:
+            return [json.dumps({"status": "error",
+                                "message": "no joint angles given"}, indent=2)]
+        try:
+            return [json.dumps({"status": "success", **mover(targets)}, indent=2)]
+        except ValueError as e:
+            return [json.dumps({"status": "error", "message": str(e)}, indent=2)]
 
     # ── Servo-space jogging (hardware only) ───────────────────────────────────
 

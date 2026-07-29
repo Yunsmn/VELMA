@@ -26,12 +26,13 @@ import numpy as np
 # The gripper's own jaws occupy the bottom of the wrist view and are pale
 # plastic; excluded so they are never picked as the target.
 #
-# How far up the frame they reach depends on the arm's posture. With the arm
-# raised and the camera looking steeply down, the target sits LOW in the frame —
-# at 0.62 the mask was clipping the adapter itself and detection failed outright.
-# The jaws are pale and score poorly against a pale table anyway, so the band can
-# afford to be generous; override for an unusual posture if needed.
-GRIPPER_BAND_FRAC = float(os.environ.get("SO101_GRIPPER_BAND_FRAC", "0.80"))
+# How far up the frame they reach depends on the arm's posture, and the target
+# often sits LOW in frame — this mask silently clipped the adapter and killed
+# detection twice, first at 0.62 and again at 0.80. In practice the jaws are pale
+# plastic against a pale table, score poorly on background distance, and have
+# never once been returned as a detection, so the band is nearly all cost and no
+# benefit. Kept only as a thin guard at the very bottom edge.
+GRIPPER_BAND_FRAC = float(os.environ.get("SO101_GRIPPER_BAND_FRAC", "0.97"))
 MIN_AREA_PX = 800
 MAX_AREA_FRAC = 0.35
 # Keeping only the top few percent of "unlike the table" pixels fails when one

@@ -1,0 +1,38 @@
+{
+  "neutral": {
+    "angles_deg": {
+      "elbow_flex": 23.21,
+      "gripper": 20.92,
+      "shoulder_lift": -14.33,
+      "shoulder_pan": -1.14,
+      "wrist_flex": 79.16,
+      "wrist_roll": 1.8
+    },
+    "note": "arm raised clear of table, jaws free",
+    "saved_at": "2026-07-29T12:20:21+00:00"
+  },
+  "pos_a": {
+    "angles_deg": {
+      "elbow_flex": 18.9,
+      "gripper": 23.43,
+      "shoulder_lift": 14.15,
+      "shoulder_pan": 20.66,
+      "wrist_flex": 78.9,
+      "wrist_roll": 2.51
+    },
+    "note": "adapter touching table, first taught position",
+    "saved_at": "2026-07-29T12:22:26+00:00"
+  },
+  "pos_b": {
+    "angles_deg": {
+      "elbow_flex": 19.6,
+      "gripper": 23.7,
+      "shoulder_lift": 14.68,
+      "shoulder_pan": -23.56,
+      "wrist_flex": 78.9,
+      "wrist_roll": 1.8
+    },
+    "note": "adapter touching table, second taught position",
+    "saved_at": "2026-07-29T12:22:30+00:00"
+  }
+}
