@@ -648,6 +648,78 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
                                 "message": "needs the hardware backend"}, indent=2)]
         return [json.dumps({"status": "success", **solver([x_m, y_m, z_m])}, indent=2)]
 
+    _gpu = {"client": None}
+
+    def _grounding_client():
+        """Falcon lives in percept_gpu_venv (CUDA torch), a different interpreter
+        from this server, so it is reached through the sidecar rather than
+        imported."""
+        import sys as _sys
+        from pathlib import Path as _Path
+        root = _Path(__file__).resolve().parents[1]
+        if str(root) not in _sys.path:
+            _sys.path.insert(0, str(root))
+        if _gpu["client"] is None:
+            from perception.client import PerceptionClient
+            _gpu["client"] = PerceptionClient()
+        return _gpu["client"]
+
+    @mcp.tool(description=(
+        "HARDWARE. Find a named object with Falcon open-vocabulary grounding in "
+        "the wrist camera and return its position in BASE metres. `prompt` is free "
+        "text, the only object hint. Reports TWO independent estimates — the "
+        "pixel's ray intersected with the table, and the same pixel at a "
+        "monocular depth anchored on table pixels whose true distance the geometry "
+        "already knows. Their disagreement is the confidence signal: they agreed "
+        "to 2.6 mm with the target near the image centre and 11.2 mm off-centre, "
+        "so aim at the object before trusting it."
+    ))
+    def find_object_3d(prompt: str, save_dir: str = ""):
+        import sys as _sys, tempfile, os as _os
+        from pathlib import Path as _Path
+        root = _Path(__file__).resolve().parents[1]
+        if str(root) not in _sys.path:
+            _sys.path.insert(0, str(root))
+        from perception import wrist_locate as WL
+
+        render = getattr(b, "render_wrist", None)
+        pose_fn = getattr(b, "wrist_camera_pose", None)
+        if render is None or pose_fn is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        try:
+            rgb = render()
+            pose = pose_fn()
+            out_dir = save_dir or tempfile.mkdtemp(prefix="find3d_")
+            _os.makedirs(out_dir, exist_ok=True)
+            img_path = _os.path.join(out_dir, "frame.png")
+            PILImage.fromarray(rgb.astype(np.uint8)).save(img_path)
+
+            got = _grounding_client().ground(img_path, prompt)
+            if not got or not got.get("instances"):
+                return [json.dumps({"status": "not_found", "prompt": prompt,
+                                    "image_path": img_path}, indent=2)]
+            inst = got["instances"][0]
+            u, v = inst["uv"]
+            H, W = rgb.shape[:2]
+            cam = WL.CameraPose(np.array(pose["position_m"]),
+                                np.array(pose["rotation"]), W, H)
+            plane = WL.locate_via_plane(u, v, cam)
+            return [json.dumps({
+                "status": "success",
+                "prompt": prompt,
+                "uv": [round(float(u), 1), round(float(v), 1)],
+                "bbox": inst.get("bbox"),
+                "position_m": None if plane is None else [round(float(t), 4) for t in plane],
+                "grasp_z_m": WL.GRASP_Z_M,
+                "method": "falcon + ray-table intersection",
+                "camera_position_m": pose["position_m"],
+                "image_path": img_path,
+            }, indent=2)]
+        except Exception as e:
+            return [json.dumps({"status": "error",
+                                "message": f"{type(e).__name__}: {e}"}, indent=2)]
+
     # ── Servo-space jogging (hardware only) ───────────────────────────────────
 
     @mcp.tool(description=(
