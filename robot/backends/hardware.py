@@ -765,6 +765,28 @@ class HardwareBackend(RobotBackend):
             )
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+    def wrist_camera_pose(self) -> dict:
+        """The wrist camera's pose in BASE coordinates, from forward kinematics.
+
+        The camera is rigid to the gripper, so once the joint offsets are known
+        FK gives its position and orientation for nothing — the hardware
+        equivalent of the simulation's fixed `side_cam_params`. This is what lets
+        a single detected pixel become a ray in the robot's own frame.
+
+        The mounting transform still comes from the MuJoCo model's `wrist_cam`,
+        which was set up for a different camera part, so treat the pose as good
+        to a few millimetres and degrees rather than exact.
+        """
+        self._sync_mujoco_state()
+        cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
+        if cam_id < 0:
+            raise RuntimeError("model has no camera named 'wrist_cam'")
+        return {
+            "position_m": [round(float(v), 5) for v in self.data.cam_xpos[cam_id]],
+            "rotation": [[round(float(v), 6) for v in row]
+                         for row in self.data.cam_xmat[cam_id].reshape(3, 3)],
+        }
+
     def render_side(self) -> None:
         """There is no side camera on this rig — only two USB ports, both spoken
         for. Returning None makes callers say so; rendering the MuJoCo side camera

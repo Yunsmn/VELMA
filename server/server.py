@@ -584,6 +584,30 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
                             "limits_deg": {k: [round(v[0], 2), round(v[1], 2)]
                                            for k, v in getter().items()}}, indent=2)]
 
+    @mcp.tool(description=(
+        "HARDWARE. Save a wrist-camera frame together with the camera's pose in "
+        "BASE coordinates, derived from forward kinematics. This is what turns a "
+        "detected pixel into a ray in the robot's own frame — the hardware "
+        "equivalent of the simulation's fixed side-camera extrinsic."
+    ))
+    def capture_with_pose(image_path: str = "/tmp/wrist_frame.png"):
+        render = getattr(b, "render_wrist", None)
+        pose_fn = getattr(b, "wrist_camera_pose", None)
+        if render is None or pose_fn is None:
+            return [json.dumps({"status": "unsupported",
+                                "message": "needs the hardware backend"}, indent=2)]
+        rgb = render()
+        PILImage.fromarray(rgb.astype(np.uint8)).save(image_path)
+        st = b.get_state()
+        return [json.dumps({
+            "status": "success",
+            "image_path": image_path,
+            "image_size": [int(rgb.shape[1]), int(rgb.shape[0])],
+            "camera": pose_fn(),
+            "end_effector_m": st.end_effector_m,
+            "joint_angles_deg": st.joint_angles_deg,
+        }, indent=2)]
+
     # ── Servo-space jogging (hardware only) ───────────────────────────────────
 
     @mcp.tool(description=(
