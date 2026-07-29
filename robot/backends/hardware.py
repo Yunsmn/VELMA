@@ -68,15 +68,32 @@ ALL_AXES = JOINT_NAMES + ["gripper"]
 # the roll joint (the jaws shift in frame when it turns). Left at +1, UNVERIFIED.
 JOINT_SIGN = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
 
-# OFFSETS: still unmeasured, and this is the live problem. Matching each joint's
-# calibrated half-span against the model's range suggests offsets near zero
-# (elbow +-97.2 vs +-96.8 deg, lift +-104.5 vs +-100), but that cannot be the whole
-# story: at the arm's actual pose the model puts the gripper 33 mm BELOW the base
-# plane while the camera plainly shows it above the table. Something in the zero
-# convention is still wrong, so IK-driven tools (move_to_position, grasp, place)
-# must not be trusted yet. Fixing this needs an absolute spatial reference — e.g.
-# touching a known point and solving for the offsets — not another sign check.
-JOINT_OFFSET_DEG = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+# OFFSETS: MEASURED 2026-07-29 from a single reference posture.
+#
+# lerobot puts each joint's zero at the midpoint of its calibrated sweep, which
+# is meaningless here because this arm's joint limits are COUPLED — across three
+# calibrations shoulder_pan and elbow_flex reproduced to 2-4 ticks while
+# wrist_flex and wrist_roll never reproduced at all. Sweeping to mechanical stops
+# does not rescue it either: the elbow's stop is set by the wrist camera's bulk,
+# so it is a collision limit that moves with the arm's configuration.
+#
+# Instead the arm was posed BY HAND into a posture the model defines exactly —
+# upper arm vertical, forearm horizontal, gripper axis horizontal, arm pointing
+# straight forward — and the servos read there. The wrist camera confirmed the
+# gripper was horizontal (it saw the room, not the table); the first attempt had
+# it pointing down and produced a nonsense 106 deg offset, which is how that
+# error was caught.
+#
+#   joint          servo@ref   model@ref   offset = servo - model
+#   shoulder_pan     -3.08       0.00        -3.08
+#   shoulder_lift    +2.90     -13.97       +16.87
+#   elbow_flex       +4.57     +16.18       -11.61
+#   wrist_flex       +8.40      -2.21       +10.61
+#   wrist_roll       -4.35       0.00        -4.35
+#
+# wrist_roll is the least trustworthy: its calibration hit the full encoder span
+# in all three runs, so levelling the jaws by eye is the only thing pinning it.
+JOINT_OFFSET_DEG = np.array([-3.08, 16.87, -11.61, 10.61, -4.35])
 
 # Home posture in MODEL degrees (matches the sim's neutral pose).
 HOME_DEG = np.array([0.0, 0.0, 0.0, 90.0, 90.0])
