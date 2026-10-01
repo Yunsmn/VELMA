@@ -32,7 +32,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 console = Console()
-MCP_URL = os.environ.get("MCP_URL", "http://localhost:3001/mcp")
+MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:3001/mcp")
 # Long enough for the slowest tool (a full grasp, or a wrist orbit with CPU
 # inference). Overridable for debugging.
 READ_TIMEOUT = timedelta(seconds=float(os.environ.get("MCP_READ_TIMEOUT", "300")))

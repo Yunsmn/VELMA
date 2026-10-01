@@ -41,7 +41,7 @@ CLI_TOOLS = {
     "Codex CLI":    "Run: codex  (picks up .mcp.json automatically)",
     "Gemini CLI":   "Run: gemini  (add server URL in ~/.gemini/config if needed)",
     "Cursor":       "Add server URL in Cursor → Settings → MCP Servers",
-    "Other / any":  "Point your client at http://localhost:{port}/mcp",
+    "Other / any":  "Point your client at http://127.0.0.1:{port}/mcp",
 }
 
 API_PROVIDERS = {
@@ -190,7 +190,7 @@ def configure_llm(cfg: dict) -> dict:
     cfg["llm"]["model"] = model
 
     if provider == "ollama":
-        current_url = _get(cfg, "llm", "base_url", default="http://localhost:11434")
+        current_url = _get(cfg, "llm", "base_url", default="http://127.0.0.1:11434")
         url = questionary.text("Ollama base URL:", default=current_url).ask()
         cfg["llm"]["base_url"] = url
         return cfg
@@ -245,7 +245,7 @@ def configure_server(cfg: dict) -> dict:
 def _update_mcp_json(port: int) -> None:
     import json
     mcp_path = Path(".mcp.json")
-    content = {"mcpServers": {"so101-sim": {"type": "http", "url": f"http://localhost:{port}/mcp"}}}
+    content = {"mcpServers": {"so101-sim": {"type": "http", "url": f"http://127.0.0.1:{port}/mcp"}}}
     mcp_path.write_text(json.dumps(content, indent=2) + "\n")
 
 
@@ -275,7 +275,7 @@ def _show_summary(cfg: dict) -> None:
 
     transport = _get(cfg, "server", "transport", default="http")
     port = _get(cfg, "server", "port", default=3001)
-    srv_val = f"{transport}" + (f"  →  http://localhost:{port}/mcp" if transport == "http" else "")
+    srv_val = f"{transport}" + (f"  →  http://127.0.0.1:{port}/mcp" if transport == "http" else "")
 
     t.add_row("Backend", bval)
     t.add_row("LLM", llm_val)

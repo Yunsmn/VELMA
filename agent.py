@@ -17,16 +17,16 @@ Works with any model / endpoint:
     you don't have to know in advance what the model can do.
 
 Endpoints:
-  - Ollama:            base_url like http://localhost:11434   (uses /api/chat)
+  - Ollama:            base_url like http://127.0.0.1:11434   (uses /api/chat)
   - OpenAI-compatible: base_url like https://...              (uses /chat/completions)
     e.g. GitHub Models, OpenAI, OpenRouter, vLLM, llama.cpp server, Ollama /v1.
 
 Config via env or flags:
   LLM_MODEL / --model        e.g. gemma4-cpu  or  openai/gpt-5-mini
-  LLM_BASE_URL / --base-url  default http://localhost:11434  (Ollama)
+  LLM_BASE_URL / --base-url  default http://127.0.0.1:11434  (Ollama)
   LLM_API_KEY / --api-key    token if the endpoint needs one (local: leave empty)
   --mode auto|native|text    default auto
-  --mcp-url                  default http://localhost:3001/mcp
+  --mcp-url                  default http://127.0.0.1:3001/mcp
   --task "..."               one-shot task; omit for an interactive REPL
 
 Examples:
@@ -52,8 +52,8 @@ import requests
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-MCP_URL        = os.environ.get("MCP_URL", "http://localhost:3001/mcp")
-DEFAULT_BASE   = os.environ.get("LLM_BASE_URL", "http://localhost:11434")
+MCP_URL        = os.environ.get("MCP_URL", "http://127.0.0.1:3001/mcp")
+DEFAULT_BASE   = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:11434")
 # Co-located with this file so a standalone so101-Models checkout is self-contained
 # (this used to point at ../skills/so101-arm/SKILL.md, one level ABOVE this project,
 # which only existed in the full monorepo checkout). skills/so101-arm/SKILL.md in the

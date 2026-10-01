@@ -81,7 +81,7 @@ that times out mid-call takes the server down with it.
 With the headless server running (above), pick one of two paths:
 
 **A CLI tool that speaks MCP** (Claude Code, Codex CLI, Gemini CLI, Cursor, ...): this repo's
-`.mcp.json` already points at `http://localhost:3001/mcp` — just run the CLI tool from inside
+`.mcp.json` already points at `http://127.0.0.1:3001/mcp` — just run the CLI tool from inside
 `so101-Models/` (e.g. `claude`). If you changed `config.yaml`'s `server.port`, re-run
 `./venv/bin/python setup.py` (Server settings) to regenerate `.mcp.json` to match.
 

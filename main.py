@@ -117,7 +117,7 @@ def main() -> None:
         f"[bold]SO-101 Robot Controller[/bold]\n\n"
         f"  Backend   : [cyan]{backend_type}{'  (viewer on)' if open_viewer else ''}[/cyan]\n"
         f"  Transport : [cyan]{transport}"
-        + (f"  →  http://localhost:{port}/mcp" if transport == "http" else "")
+        + (f"  →  http://127.0.0.1:{port}/mcp" if transport == "http" else "")
         + f"[/cyan]\n"
         f"  LLM       : [cyan]{llm_label}[/cyan]\n\n"
         f"[dim]Waiting for connections…  Ctrl+C to stop.[/dim]",

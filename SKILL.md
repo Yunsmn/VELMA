@@ -33,7 +33,7 @@ tools; once you are, the tools below appear in your runtime like any other.
 offscreen rendering — see the project README). When it's up it serves MCP at:
 
 ```
-http://localhost:3001/mcp        (transport: streamable-http)
+http://127.0.0.1:3001/mcp        (transport: streamable-http)
 ```
 
 **Connect your client** to that URL:
@@ -42,11 +42,11 @@ http://localhost:3001/mcp        (transport: streamable-http)
   add a server entry pointing at it:
   ```json
   { "mcpServers": { "so101-sim": { "type": "streamable-http",
-                                    "url": "http://localhost:3001/mcp" } } }
+                                    "url": "http://127.0.0.1:3001/mcp" } } }
   ```
 - If you're writing the client yourself, open a streamable-http MCP session to
   the same URL, initialize it, then list tools. (In Python that's
-  `streamablehttp_client("http://localhost:3001/mcp")` → `ClientSession` →
+  `streamablehttp_client("http://127.0.0.1:3001/mcp")` → `ClientSession` →
   `await session.initialize()` → `await session.list_tools()`.) Set a **long
   read timeout** (300s) — `grasp`/`triangulate`/`stop_recording` take several
   seconds, and a client that times out mid-call can take the server down.
