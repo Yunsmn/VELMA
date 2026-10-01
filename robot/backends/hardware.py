@@ -141,7 +141,21 @@ POLL_INTERVAL_S = 0.05        # 20 Hz goal refresh + readback
 ARRIVE_TOL_DEG = 0.8
 STALL_EPS_DEG = 0.15          # per-poll movement below this counts as no progress
 STALL_POLLS = 8               # ~0.4 s of no progress means it is not going further
-DEFAULT_MOVE_TIMEOUT_S = 8.0
+# A multi-joint move drives one axis at a time and revisits any that drooped when
+# a neighbour moved, so it needs room for several passes over several joints.
+# 8 s was sized for a single simultaneous command and cut sequential moves short.
+DEFAULT_MOVE_TIMEOUT_S = float(os.environ.get("SO101_MOVE_TIMEOUT_S", "60.0"))
+SEQUENTIAL_PASSES = int(os.environ.get("SO101_SEQUENTIAL_PASSES", "4"))
+
+# Gravity droop. A proportional servo settles where its torque balances the load,
+# so a joint carrying weight stops SHORT of its goal and stays there: measured on
+# this arm, repeating the same Cartesian move four times left the error stuck at
+# 30-33 mm with shoulder_lift 2.6-3.0 deg and elbow_flex 3.4-3.8 deg short, every
+# time. Re-commanding the same goal cannot fix it — the equilibrium is the same.
+# Aiming as far BEYOND the goal as the joint fell short supplies the extra error
+# the servo needs to close the gap.
+DROOP_COMP_ROUNDS = int(os.environ.get("SO101_DROOP_ROUNDS", "3"))
+DROOP_COMP_MAX_DEG = float(os.environ.get("SO101_DROOP_MAX_DEG", "10.0"))
 
 # Smooth limit sweeps. The goal advances at a fixed rate so the servo follows a
 # moving setpoint rather than lunging at a distant one.
@@ -508,14 +522,55 @@ class HardwareBackend(RobotBackend):
         except Exception:
             return None
 
+    def _drive_axis(self, joint: str, target: float, hold: dict[str, float],
+                    deadline: float) -> bool:
+        """Goal-and-poll ONE axis to `target`, holding the others where they are.
+
+        Returns True if it arrived, False if it stopped making progress. This is
+        the only drive primitive measured to work under load on this arm; see
+        goto_servo_angles for why nothing else does.
+        """
+        previous = self._read_all()[joint]
+        stalled_polls = 0
+        while time.time() < deadline:
+            blended = {**hold, joint: target}
+            self._send(np.array([blended[j] for j in JOINT_NAMES]), blended["gripper"])
+            time.sleep(POLL_INTERVAL_S)
+
+            reached = self._read_all()[joint]
+            if abs(reached - target) <= ARRIVE_TOL_DEG:
+                return True
+            if abs(reached - previous) < STALL_EPS_DEG:
+                stalled_polls += 1
+                if stalled_polls >= STALL_POLLS:
+                    return False
+            else:
+                stalled_polls = 0
+            previous = reached
+        return False
+
     def goto_servo_angles(self, targets: dict[str, float],
                           timeout_s: float = DEFAULT_MOVE_TIMEOUT_S) -> dict:
-        """Drive several joints to ABSOLUTE servo angles at once.
+        """Drive several joints to ABSOLUTE servo angles, ONE AXIS AT A TIME.
 
-        Moving joints together is both quicker and gentler than one at a time:
-        the arm sweeps a direct path instead of a staircase. Same goal-and-poll
-        approach as a single jog, and the gripper is left alone unless named, so
-        a held object keeps being held.
+        Commanding every joint to a distant goal simultaneously does not work on
+        this arm, and it fails SILENTLY. Measured directly: with all five held at
+        a far goal, shoulder_lift and elbow_flex stop dead while shoulder_pan
+        converges normally — lerobot's safety clamp reported an unchanging
+        `present` for both loaded joints across dozens of control cycles. Driven
+        individually from the same pose and in the same direction, those same
+        joints move 6-9 degrees per call. So the arm is not torque-limited; only
+        the simultaneous command is. That is why this cycles axis by axis.
+
+        Several passes are needed because moving one joint shifts the gravity
+        load on the others, so an axis that arrived can droop once its neighbour
+        moves. Each pass re-reads and re-drives whatever has fallen outside
+        tolerance, and the loop exits early once a full pass changes nothing.
+
+        The cost is path shape: the end effector staircases rather than sweeping
+        a straight line, so callers must NOT assume an interpolated path between
+        start and target. The gripper is left alone unless named, so a held
+        object keeps being held.
         """
         unknown = set(targets) - set(ALL_AXES)
         if unknown:
@@ -530,30 +585,55 @@ class HardwareBackend(RobotBackend):
 
         moving = [j for j in targets if j != "gripper"]
         deadline = time.time() + timeout_s
-        previous = {j: start[j] for j in moving}
-        stalled_polls = 0
 
-        while time.time() < deadline:
-            self._send(np.array([goal[j] for j in JOINT_NAMES]), goal["gripper"])
-            time.sleep(POLL_INTERVAL_S)
-
+        for _ in range(SEQUENTIAL_PASSES):
             now = self._read_all()
-            if moving and max(abs(now[j] - goal[j]) for j in moving) <= ARRIVE_TOL_DEG:
+            lagging = [j for j in moving if abs(now[j] - goal[j]) > ARRIVE_TOL_DEG]
+            if not lagging:
                 break
-            if moving and max(abs(now[j] - previous[j]) for j in moving) < STALL_EPS_DEG:
-                stalled_polls += 1
-                if stalled_polls >= STALL_POLLS:
+            progressed = False
+            for joint in lagging:
+                if time.time() >= deadline:
                     break
-            else:
-                stalled_polls = 0
-            previous = {j: now[j] for j in moving}
+                before = self._read_all()[joint]
+                # Hold the others at their PRESENT reading, not at their goal:
+                # a neighbour carrying a large error is exactly what freezes the
+                # loaded axes.
+                hold = {**self._read_all(), "gripper": self._gripper_goal_pct}
+                self._drive_axis(joint, goal[joint], hold, deadline)
+                after = self._read_all()[joint]
+                if abs(after - before) >= STALL_EPS_DEG:
+                    progressed = True
+            if not progressed:
+                break   # nothing is moving any more; further passes cannot help
+
+        # Droop compensation. Whatever is still short is short because the servo
+        # has reached its own equilibrium, so aim past the goal by the shortfall.
+        for _ in range(DROOP_COMP_ROUNDS):
+            now = self._read_all()
+            lagging = [j for j in moving if abs(now[j] - goal[j]) > ARRIVE_TOL_DEG]
+            if not lagging or time.time() >= deadline:
+                break
+            improved = False
+            for joint in lagging:
+                if time.time() >= deadline:
+                    break
+                error = goal[joint] - now[joint]
+                bias = float(np.clip(error, -DROOP_COMP_MAX_DEG, DROOP_COMP_MAX_DEG))
+                hold = {**self._read_all(), "gripper": self._gripper_goal_pct}
+                self._drive_axis(joint, goal[joint] + bias, hold, deadline)
+                if abs(self._read_all()[joint] - goal[joint]) < abs(error) - STALL_EPS_DEG:
+                    improved = True
+            if not improved:
+                break   # overshooting is not helping; stop before it oscillates
 
         end = self._read_all()
+        residual = {k: end[k] - goal[k] for k in moving}
         return {
             "target_deg": {k: round(v, 2) for k, v in targets.items()},
             "reached_deg": {k: round(end[k], 2) for k in ALL_AXES},
-            "residual_deg": {k: round(end[k] - goal[k], 2) for k in moving},
-            "stalled": stalled_polls >= STALL_POLLS,
+            "residual_deg": {k: round(v, 2) for k, v in residual.items()},
+            "stalled": any(abs(v) > ARRIVE_TOL_DEG for v in residual.values()),
         }
 
     def calibrated_limits(self) -> dict[str, tuple[float, float]]:
@@ -693,7 +773,8 @@ class HardwareBackend(RobotBackend):
                           for i, n in enumerate(JOINT_NAMES)},
         }
 
-    def move_to_xyz(self, target_xyz, timeout_s: float = 12.0) -> dict:
+    def move_to_xyz(self, target_xyz,
+                    timeout_s: float = DEFAULT_MOVE_TIMEOUT_S) -> dict:
         """Solve IK in the model, then command the whole joint solution at once."""
         sol = self.solve_ik(target_xyz)
         if not sol["reachable"]:
