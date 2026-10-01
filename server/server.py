@@ -954,7 +954,7 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
                 "prompt": prompt, "found": False,
                 "error": f"{type(e).__name__}: {e}",
                 "hint": "perception sidecar unavailable — build "
-                        "experiments/scratch/percept_venv; SAM3 needs sam3.pt "
+                        "percept_venv (see README, Install); SAM3 needs sam3.pt "
                         "(else it stubs) and PERCEPT_DEPTH_MODEL selects the "
                         "metric-depth backend (default constant_stub).",
             }, indent=2)]
@@ -1015,7 +1015,7 @@ def create_server(controller: RobotController, port: int = 3001) -> FastMCP:
                 "prompt": prompt, "found": False,
                 "error": f"{type(e).__name__}: {e}",
                 "hint": "perception sidecar unavailable — build "
-                        "experiments/scratch/percept_venv.",
+                        "percept_venv (see README, Install).",
             }, indent=2)]
 
     return mcp
